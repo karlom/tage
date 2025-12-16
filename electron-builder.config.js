@@ -15,6 +15,7 @@ export default {
   },
   asar: true,
   mac: {
+    icon: 'build/icon.icns',
     category: 'public.app-category.productivity',
     target: ['dmg', 'zip'],
   },

@@ -75,6 +75,31 @@ export interface ToolCall {
   };
 }
 
+// 工具执行上下文
+export interface ToolContext {
+  toolCall: ToolCall;
+  args: Record<string, unknown>;
+}
+
+// 工具中间件接口
+export type Middleware = (
+  context: ToolContext,
+  next: () => Promise<ToolResult>
+) => Promise<ToolResult>;
+
+// 全局中间件列表
+const globalMiddlewares: Middleware[] = [];
+
+// 注册中间件
+export function useToolMiddleware(middleware: Middleware) {
+  globalMiddlewares.push(middleware);
+}
+
+// 清除中间件 (用于测试或重置)
+export function clearToolMiddlewares() {
+  globalMiddlewares.length = 0;
+}
+
 // 工具执行结果接口
 export interface ToolResult {
   toolCallId: string;
@@ -117,7 +142,7 @@ async function executeWebFetch(args: { url?: string }): Promise<string> {
     }
 
     const contentType = response.headers.get('content-type') || '';
-    
+
     if (contentType.includes('application/json')) {
       const json = await response.json();
       return JSON.stringify(json, null, 2);
@@ -158,7 +183,7 @@ async function searchWithSerpAPI(query: string, apiKey: string): Promise<string>
     }
 
     const data = await response.json();
-    
+
     // 提取搜索结果
     const results = (data.organic_results || []).slice(0, 10).map((result: any) => ({
       title: result.title || '',
@@ -182,10 +207,10 @@ async function searchWithBrave(query: string, apiKey: string): Promise<string> {
   try {
     // 检查是否在开发环境，使用代理避免 CORS 问题
     const isDev = import.meta.env.DEV;
-    const baseUrl = isDev 
+    const baseUrl = isDev
       ? '/api/brave/res/v1/web/search'
       : 'https://api.search.brave.com/res/v1/web/search';
-    
+
     const url = `${baseUrl}?q=${encodeURIComponent(query)}&count=10`;
     const response = await fetch(url, {
       headers: {
@@ -204,7 +229,7 @@ async function searchWithBrave(query: string, apiKey: string): Promise<string> {
         const errorText = await response.text();
         errorMessage = errorText || '';
       }
-      
+
       if (response.status === 400) {
         throw new Error(`请求参数错误: ${errorMessage || '请检查查询参数格式'}`);
       }
@@ -218,7 +243,7 @@ async function searchWithBrave(query: string, apiKey: string): Promise<string> {
     }
 
     const data = await response.json();
-    
+
     // 提取搜索结果
     const results = ((data.web && data.web.results) || []).map((result: any) => ({
       title: result.title || '',
@@ -255,7 +280,7 @@ async function searchWithGoogle(query: string, apiKey: string, searchEngineId: s
     }
 
     const data = await response.json();
-    
+
     // 提取搜索结果
     const results = ((data.items) || []).map((result: any) => ({
       title: result.title || '',
@@ -274,7 +299,73 @@ async function searchWithGoogle(query: string, apiKey: string, searchEngineId: s
   }
 }
 
-// 网络搜索工具 - 支持 SerpAPI、Brave Search API 和 Google Custom Search API
+// Tavily Search API 搜索实现（专为 AI Agent 优化）
+async function searchWithTavily(query: string, apiKey: string): Promise<string> {
+  try {
+    // 检查是否在开发环境，使用代理避免 CORS 问题
+    const isDev = import.meta.env.DEV;
+    const baseUrl = isDev
+      ? '/api/tavily/search'
+      : 'https://api.tavily.com/search';
+
+    const response = await fetch(baseUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        api_key: apiKey,
+        query: query,
+        search_depth: 'basic', // 'basic' = 1 credit, 'advanced' = 2 credits
+        include_answer: true,  // 包含 AI 生成的答案摘要
+        include_raw_content: false,
+        max_results: 10,
+      }),
+    });
+
+    if (!response.ok) {
+      let errorMessage = '';
+      try {
+        const errorData = await response.json();
+        errorMessage = errorData.detail || errorData.message || errorData.error || '';
+      } catch {
+        const errorText = await response.text();
+        errorMessage = errorText || '';
+      }
+
+      if (response.status === 401) {
+        throw new Error('API Key 无效，请检查 Tavily API 配置');
+      }
+      if (response.status === 429) {
+        throw new Error('API 调用次数已达上限，请稍后再试或升级套餐');
+      }
+      throw new Error(`Tavily API 请求失败: ${response.status} ${response.statusText}${errorMessage ? ' - ' + errorMessage : ''}`);
+    }
+
+    const data = await response.json();
+
+    // Tavily 返回的结构包含 answer（AI 摘要）和 results（搜索结果）
+    const results = (data.results || []).map((result: any) => ({
+      title: result.title || '',
+      snippet: result.content || '',
+      url: result.url || '',
+      score: result.score || 0, // Tavily 提供相关性评分
+    }));
+
+    return JSON.stringify({
+      query,
+      provider: 'Tavily',
+      // Tavily 特有的 AI 生成答案摘要
+      answer: data.answer || null,
+      results,
+      count: results.length,
+    }, null, 2);
+  } catch (error) {
+    throw new Error(`Tavily Search API 搜索失败: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+// 网络搜索工具 - 支持 SerpAPI、Brave Search API、Google Custom Search API 和 Tavily
 async function executeWebSearch(args: { query?: string }): Promise<string> {
   const query = args.query;
   if (!query) {
@@ -317,6 +408,8 @@ async function executeWebSearch(args: { query?: string }): Promise<string> {
       return await searchWithBrave(query, config.apiKey);
     } else if (config.provider === 'google') {
       return await searchWithGoogle(query, config.apiKey, config.searchEngineId!);
+    } else if (config.provider === 'tavily') {
+      return await searchWithTavily(query, config.apiKey);
     } else {
       throw new Error(`不支持的搜索提供商: ${config.provider}`);
     }
@@ -409,10 +502,10 @@ async function executeCalculator(args: { expression?: string }): Promise<string>
     if (sanitized !== expression.replace(/\s/g, '')) {
       throw new Error('表达式包含不允许的字符');
     }
-    
+
     // 使用 Function 进行计算（比 eval 更安全一点）
     const result = new Function(`return (${sanitized})`)();
-    
+
     return JSON.stringify({
       expression,
       result: result,
@@ -459,37 +552,67 @@ async function executeMacCalendarListToday(_args: Record<string, unknown>): Prom
 set today to current date
 set todayMidnight to today - (time of today)
 set tomorrow to todayMidnight + 1 * days
-set output to {}
+set output to ""
+
 tell application "Calendar"
-  set targetCal to first calendar
-  set todaysEvents to every event of targetCal whose start date ≥ todayMidnight and start date < tomorrow
-  repeat with ev in todaysEvents
-    set end of output to (summary of ev & " | " & (start date of ev as string) & " - " & (end date of ev as string) & (if (location of ev is not missing value) then " | " & location of ev else ""))
+  repeat with cal in calendars
+    set todaysEvents to (every event of cal whose start date >= todayMidnight and start date < tomorrow)
+    repeat with ev in todaysEvents
+      set eventInfo to summary of ev & " | " & (start date of ev as string) & " - " & (end date of ev as string)
+      try
+        set loc to location of ev
+        if loc is not missing value and loc is not "" then
+          set eventInfo to eventInfo & " | " & loc
+        end if
+      end try
+      set output to output & eventInfo & return
+    end repeat
   end repeat
 end tell
-return output as string
+
+if output is "" then
+  return "今天没有日历事件"
+else
+  return output
+end if
 `;
   return runAppleScript(script);
 }
 
 async function executeMacReminderAdd(args: { title?: string; dueTime?: string; listName?: string; notes?: string }): Promise<string> {
-  const { title, dueTime, listName, notes } = args;
+  const { title, dueTime, notes } = args;
   if (!title) {
     throw new Error('缺少必需参数: title');
   }
 
-  const script = `
-set reminderTitle to "${escapeAppleScriptString(title)}"
-set reminderNotes to "${escapeAppleScriptString(notes || '')}"
-${dueTime ? `set reminderDue to date "${escapeAppleScriptString(dueTime)}"` : 'set reminderDue to missing value'}
-set targetListName to "${escapeAppleScriptString(listName || '')}"
+  // Build a simpler AppleScript that works reliably
+  const escapedTitle = escapeAppleScriptString(title);
+  const escapedNotes = escapeAppleScriptString(notes || '');
 
+  let script: string;
+
+  if (dueTime) {
+    script = `
 tell application "Reminders"
-  set targetList to (if targetListName is "" then default list else list targetListName)
-  make new reminder at targetList with properties {name:reminderTitle${dueTime ? ', remind me date:reminderDue' : ''}, body:reminderNotes}
+  set targetDate to current date
+  set year of targetDate to ${new Date(dueTime).getFullYear()}
+  set month of targetDate to ${new Date(dueTime).getMonth() + 1}
+  set day of targetDate to ${new Date(dueTime).getDate()}
+  set hours of targetDate to ${new Date(dueTime).getHours()}
+  set minutes of targetDate to ${new Date(dueTime).getMinutes()}
+  set seconds of targetDate to 0
+  make new reminder with properties {name:"${escapedTitle}", body:"${escapedNotes}", remind me date:targetDate}
 end tell
 return "created"
 `;
+  } else {
+    script = `
+tell application "Reminders"
+  make new reminder with properties {name:"${escapedTitle}", body:"${escapedNotes}"}
+end tell
+return "created"
+`;
+  }
 
   return runAppleScript(script);
 }
@@ -499,13 +622,122 @@ async function executeMacReminderListToday(_args: Record<string, unknown>): Prom
 set today to current date
 set todayMidnight to today - (time of today)
 set tomorrow to todayMidnight + 1 * days
-set output to {}
+set output to ""
+
 tell application "Reminders"
-  repeat with r in (every reminder whose remind me date is not missing value and remind me date ≥ todayMidnight and remind me date < tomorrow)
-    set end of output to (name of r & " | due: " & (remind me date of r as string) & (if (body of r is not missing value) then " | " & body of r else ""))
+  repeat with reminderList in lists
+    repeat with r in (every reminder of reminderList whose completed is false)
+      try
+        set dueDate to remind me date of r
+        if dueDate is not missing value and dueDate >= todayMidnight and dueDate < tomorrow then
+          set reminderInfo to name of r & " | due: " & (dueDate as string)
+          try
+            set reminderBody to body of r
+            if reminderBody is not missing value and reminderBody is not "" then
+              set reminderInfo to reminderInfo & " | " & reminderBody
+            end if
+          end try
+          set output to output & reminderInfo & return
+        end if
+      end try
+    end repeat
   end repeat
 end tell
-return output as string
+
+if output is "" then
+  return "今天没有提醒事项"
+else
+  return output
+end if
+`;
+  return runAppleScript(script);
+}
+
+// 获取所有提醒列表名称
+async function executeMacReminderLists(_args: Record<string, unknown>): Promise<string> {
+  const script = `
+tell application "Reminders"
+  set listNames to name of every list
+  set output to ""
+  repeat with listName in listNames
+    set output to output & listName & return
+  end repeat
+  return output
+end tell
+`;
+  return runAppleScript(script);
+}
+
+// 获取指定列表中所有未完成的提醒
+async function executeMacReminderListAll(args: { listName?: string }): Promise<string> {
+  const { listName } = args;
+
+  if (!listName) {
+    // 如果没有指定列表名，返回所有列表中的所有未完成提醒
+    const script = `
+tell application "Reminders"
+  set output to ""
+  repeat with reminderList in lists
+    set listTitle to name of reminderList
+    set uncompletedReminders to (every reminder of reminderList whose completed is false)
+    if (count of uncompletedReminders) > 0 then
+      set output to output & "【" & listTitle & "】" & return
+      repeat with r in uncompletedReminders
+        set reminderInfo to "  - " & name of r
+        try
+          set dueDate to remind me date of r
+          if dueDate is not missing value then
+            set reminderInfo to reminderInfo & " | due: " & (dueDate as string)
+          end if
+        end try
+        set output to output & reminderInfo & return
+      end repeat
+      set output to output & return
+    end if
+  end repeat
+  if output is "" then
+    return "没有未完成的提醒事项"
+  else
+    return output
+  end if
+end tell
+`;
+    return runAppleScript(script);
+  }
+
+  // 指定了列表名
+  const escapedListName = escapeAppleScriptString(listName);
+  const script = `
+tell application "Reminders"
+  try
+    set targetList to list "${escapedListName}"
+    set uncompletedReminders to (every reminder of targetList whose completed is false)
+    set output to ""
+    repeat with r in uncompletedReminders
+      set reminderInfo to name of r
+      try
+        set dueDate to remind me date of r
+        if dueDate is not missing value then
+          set reminderInfo to reminderInfo & " | due: " & (dueDate as string)
+        end if
+      end try
+      try
+        set reminderBody to body of r
+        if reminderBody is not missing value and reminderBody is not "" then
+          set reminderInfo to reminderInfo & " | " & reminderBody
+        end if
+      end try
+      set output to output & reminderInfo & return
+    end repeat
+    if output is "" then
+      return "列表 \"${escapedListName}\" 中没有未完成的提醒"
+    else
+      return output
+    end if
+  on error errMsg
+    return "错误: " & errMsg & ". 请先使用 mac_reminder_lists 获取有效的列表名称。"
+  end try
+end tell
 `;
   return runAppleScript(script);
 }
@@ -562,6 +794,8 @@ const toolExecutors: Record<string, ToolExecutor> = {
   'mac_calendar_list_today': executeMacCalendarListToday,
   'mac_reminder_add': executeMacReminderAdd,
   'mac_reminder_list_today': executeMacReminderListToday,
+  'mac_reminder_lists': executeMacReminderLists,
+  'mac_reminder_list_all': executeMacReminderListAll,
   'mac_set_volume': executeMacSetVolume,
   'mac_open_app': executeMacOpenApp,
   'mac_run_shell': executeMacRunShell,
@@ -581,7 +815,7 @@ export function generateToolDefinitions(selectedToolIds: string[]): {
 }[] {
   const allTools = getTools();
   const selectedTools = allTools.filter(t => selectedToolIds.includes(t.id));
-  
+
   return selectedTools.map(tool => ({
     type: 'function' as const,
     function: {
@@ -682,6 +916,17 @@ function getToolParameters(toolId: string): Record<string, unknown> {
       type: 'object',
       properties: {},
     },
+    'mac_reminder_lists': {
+      type: 'object',
+      properties: {},
+      description: '获取所有提醒事项列表的名称，用于了解用户有哪些列表',
+    },
+    'mac_reminder_list_all': {
+      type: 'object',
+      properties: {
+        listName: { type: 'string', description: '要查询的列表名称（可选，不填则返回所有列表的未完成提醒）' },
+      },
+    },
     'mac_set_volume': {
       type: 'object',
       properties: {
@@ -711,7 +956,7 @@ function getToolParameters(toolId: string): Record<string, unknown> {
       required: ['script'],
     },
   };
-  
+
   return parameterDefinitions[toolId] || { type: 'object', properties: {} };
 }
 
@@ -723,9 +968,9 @@ export async function executeToolCall(
   callbacks?: ToolExecutionCallbacks
 ): Promise<ToolResult> {
   const toolName = toolCall.function.name;
-  
+
   callbacks?.onStart?.(toolCall);
-  
+
   try {
     // 解析参数
     let args: Record<string, unknown> = {};
@@ -734,29 +979,45 @@ export async function executeToolCall(
     } catch {
       throw new Error('无法解析工具参数');
     }
-    
+
     // 查找执行器
     const executor = toolExecutors[toolName];
     if (!executor) {
       throw new Error(`未知的工具: ${toolName}`);
     }
-    
-    // 执行工具
-    const result = await executor(args);
-    
-    const toolResult: ToolResult = {
-      toolCallId: toolCall.id,
-      toolName,
-      result,
-      success: true,
+
+    // 构建上下文
+    const context: ToolContext = {
+      toolCall,
+      args,
     };
-    
+
+    // 组合中间件链
+    const executeChain = async (index: number): Promise<ToolResult> => {
+      if (index < globalMiddlewares.length) {
+        const middleware = globalMiddlewares[index];
+        return middleware(context, () => executeChain(index + 1));
+      } else {
+        // 链的末端：执行实际工具
+        const result = await executor(args);
+        return {
+          toolCallId: toolCall.id,
+          toolName,
+          result,
+          success: true,
+        };
+      }
+    };
+
+    // 执行中间件链
+    const toolResult = await executeChain(0);
+
     callbacks?.onComplete?.(toolResult);
-    
+
     return toolResult;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    
+
     const toolResult: ToolResult = {
       toolCallId: toolCall.id,
       toolName,
@@ -764,9 +1025,9 @@ export async function executeToolCall(
       success: false,
       error: errorMessage,
     };
-    
+
     callbacks?.onError?.(toolCall.id, error instanceof Error ? error : new Error(errorMessage));
-    
+
     return toolResult;
   }
 }
@@ -777,12 +1038,12 @@ export async function executeToolCalls(
   callbacks?: ToolExecutionCallbacks
 ): Promise<ToolResult[]> {
   const results: ToolResult[] = [];
-  
+
   for (const toolCall of toolCalls) {
     const result = await executeToolCall(toolCall, callbacks);
     results.push(result);
   }
-  
+
   return results;
 }
 
@@ -804,6 +1065,6 @@ export function getToolDisplayName(toolId: string): string {
     'mac_run_shell': '运行 Shell',
     'mac_run_applescript': '运行 AppleScript',
   };
-  
+
   return displayNames[toolId] || toolId;
 }

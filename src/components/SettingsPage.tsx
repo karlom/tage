@@ -6,6 +6,7 @@ import UISettings from './settings/UISettings';
 import NetworkSettings from './settings/NetworkSettings';
 import ToolsSettings from './settings/ToolsSettings';
 import ShortcutsSettings from './settings/ShortcutsSettings';
+import QuickCommandsSettings from './settings/QuickCommandsSettings';
 import AboutSettings from './settings/AboutSettings';
 
 export type SettingsSection =
@@ -17,6 +18,7 @@ export type SettingsSection =
   | 'network'
   | 'tools'
   | 'shortcuts'
+  | 'quick_commands'
   | 'about';
 
 interface SettingsPageProps {
@@ -32,6 +34,7 @@ const sectionTitles: Record<SettingsSection, string> = {
   network: '网络',
   tools: '系统工具',
   shortcuts: '快捷键',
+  quick_commands: '快捷提示',
   about: '关于',
 };
 
@@ -50,10 +53,12 @@ export default function SettingsPage({ section }: SettingsPageProps) {
         return <UISettings />;
       case 'network':
         return <NetworkSettings />;
-    case 'tools':
-      return <ToolsSettings />;
+      case 'tools':
+        return <ToolsSettings />;
       case 'shortcuts':
         return <ShortcutsSettings />;
+      case 'quick_commands':
+        return <QuickCommandsSettings />;
       case 'about':
         return <AboutSettings />;
       default:

@@ -5,15 +5,20 @@ import SettingsPage from '@/components/SettingsPage';
 import ChatPage from '@/components/ChatPage';
 import SearchModal from '@/components/SearchModal';
 import ErrorBoundary from '@/components/ErrorBoundary';
+import { ToolApprovalModal } from '@/components/ToolApprovalModal';
+import { InspectorPanel } from '@/components/InspectorPanel';
+import { initApprovalMiddleware, type ApprovalRequestEventDetail } from '@/services/middleware';
 import type { SettingsSection } from '@/components/SettingsPage';
 import {
   getChatSessions,
   deleteChatSession as deleteSession,
   initializeStorage,
+  getGeneralSettings,
   type ChatSession,
 } from '@/services/storage';
 import { useTheme } from '@/hooks/useTheme';
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
+import { useMemoryMaintenance } from '@/hooks/useMemoryMaintenance';
 
 type AppMode = 'chat' | 'settings';
 
@@ -25,9 +30,15 @@ function App() {
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
   const [isStorageReady, setIsStorageReady] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [approvalRequest, setApprovalRequest] = useState<ApprovalRequestEventDetail | null>(null);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [developerMode, setDeveloperMode] = useState(false);
 
   // 初始化主题
   useTheme();
+
+  // 运行记忆维护（衰减与清理）
+  useMemoryMaintenance();
 
   // 刷新会话列表
   const refreshSessions = useCallback(() => {
@@ -46,6 +57,10 @@ function App() {
 
   const handleSearch = useCallback(() => {
     setSearchOpen(true);
+  }, []);
+
+  const handleToggleInspector = useCallback(() => {
+    setInspectorOpen(prev => !prev);
   }, []);
 
   const handleBackToChat = useCallback(() => {
@@ -90,9 +105,51 @@ function App() {
       setIsStorageReady(true);
       const sessions = getChatSessions();
       setChatSessions(sessions);
+
+      // 加载开发者模式设置
+      const generalSettings = getGeneralSettings();
+      setDeveloperMode(generalSettings.developerMode);
+
+      // 初始化工具审批中间件
+      initApprovalMiddleware();
     };
     init();
+
+    // 监听通用设置更新
+    const handleGeneralSettingsUpdate = () => {
+      const settings = getGeneralSettings();
+      setDeveloperMode(settings.developerMode);
+    };
+    window.addEventListener('general-settings-updated', handleGeneralSettingsUpdate);
+    return () => window.removeEventListener('general-settings-updated', handleGeneralSettingsUpdate);
   }, []);
+
+  // 监听工具审批请求
+  useEffect(() => {
+    const handleApprovalRequest = (event: Event) => {
+      const customEvent = event as CustomEvent<ApprovalRequestEventDetail>;
+      setApprovalRequest(customEvent.detail);
+    };
+
+    window.addEventListener('tool-approval-request', handleApprovalRequest);
+    return () => {
+      window.removeEventListener('tool-approval-request', handleApprovalRequest);
+    };
+  }, []);
+
+  const handleApproveTool = useCallback(() => {
+    if (approvalRequest) {
+      approvalRequest.resolve(true);
+      setApprovalRequest(null);
+    }
+  }, [approvalRequest]);
+
+  const handleRejectTool = useCallback(() => {
+    if (approvalRequest) {
+      approvalRequest.resolve(false);
+      setApprovalRequest(null);
+    }
+  }, [approvalRequest]);
 
   return (
     <ErrorBoundary>
@@ -125,6 +182,8 @@ function App() {
             onOpenSettings={handleOpenSettings}
             onBackToChat={handleBackToChat}
             onDeleteChat={handleDeleteChat}
+            onToggleInspector={handleToggleInspector}
+            developerMode={developerMode}
           />
           {mode === 'settings' ? (
             <MainContent>
@@ -152,6 +211,22 @@ function App() {
               setMode('settings');
               setSearchOpen(false);
             }}
+          />
+
+          {/* 工具审批模态框 */}
+          <ToolApprovalModal
+            isOpen={!!approvalRequest}
+            toolName={approvalRequest?.toolName || ''}
+            args={approvalRequest?.args || {}}
+            onApprove={handleApproveTool}
+            onReject={handleRejectTool}
+          />
+
+          {/* 检查器面板 */}
+          <InspectorPanel
+            sessionId={selectedChatId || ''}
+            isOpen={inspectorOpen}
+            onClose={() => setInspectorOpen(false)}
           />
         </div>
       )}

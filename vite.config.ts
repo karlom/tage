@@ -44,6 +44,12 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api\/brave/, ''),
       },
+      // 代理 Tavily API 请求以解决 CORS 问题
+      '/api/tavily': {
+        target: 'https://api.tavily.com',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/tavily/, ''),
+      },
     },
   },
   build: {

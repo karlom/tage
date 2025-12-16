@@ -20,6 +20,8 @@ interface SidebarProps {
   onOpenSettings?: () => void;
   onBackToChat?: () => void;
   onDeleteChat?: (id: string) => void;
+  onToggleInspector?: () => void; // New prop for toggling inspector
+  developerMode?: boolean; // Show developer tools like Inspector
 }
 
 const settingsMenuItems: { id: SettingsSection; label: string }[] = [
@@ -31,6 +33,7 @@ const settingsMenuItems: { id: SettingsSection; label: string }[] = [
   { id: 'network', label: '网络' },
   { id: 'tools', label: '系统工具' },
   { id: 'shortcuts', label: '快捷键' },
+  { id: 'quick_commands', label: '快捷提示' },
   { id: 'about', label: '关于' },
 ];
 
@@ -55,11 +58,10 @@ const SessionItem = memo(function SessionItem({ session, isSelected, onSelect, o
   return (
     <div
       onClick={handleSelect}
-      className={`group flex items-center justify-between px-3 py-2 text-sm rounded-lg cursor-pointer transition-colors ${
-        isSelected
-          ? 'bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300'
-          : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-zinc-800'
-      }`}
+      className={`group flex items-center justify-between px-3 py-2 text-sm rounded-lg cursor-pointer transition-colors ${isSelected
+        ? 'bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300'
+        : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-zinc-800'
+        }`}
     >
       <span className="truncate flex-1">
         {session.title}
@@ -85,6 +87,8 @@ export default memo(function Sidebar({
   onOpenSettings,
   onBackToChat,
   onDeleteChat,
+  onToggleInspector,
+  developerMode = false,
 }: SidebarProps) {
   return (
     <div className="w-[260px] h-full bg-gray-50 dark:bg-zinc-900 flex flex-col border-r border-gray-200 dark:border-zinc-800">
@@ -111,11 +115,10 @@ export default memo(function Sidebar({
                   <div
                     key={item.id}
                     onClick={() => onSectionChange?.(item.id)}
-                    className={`px-3 py-2 text-sm rounded cursor-pointer transition-colors ${
-                      selectedSection === item.id
-                        ? 'bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300 font-medium'
-                        : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-zinc-800'
-                    }`}
+                    className={`px-3 py-2 text-sm rounded cursor-pointer transition-colors ${selectedSection === item.id
+                      ? 'bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300 font-medium'
+                      : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-zinc-800'
+                      }`}
                   >
                     {item.label}
                   </div>
@@ -155,15 +158,37 @@ export default memo(function Sidebar({
                       key={session.id}
                       session={session}
                       isSelected={selectedChatId === session.id}
-                      onSelect={onChatSelect || (() => {})}
-                      onDelete={onDeleteChat || (() => {})}
+                      onSelect={onChatSelect || (() => { })}
+                      onDelete={onDeleteChat || (() => { })}
                     />
                   ))
                 )}
               </div>
 
               {/* 底部设置按钮 */}
-              <div className="mt-4 pt-4 border-t border-gray-200 dark:border-zinc-800">
+              <div className="border-t border-white/5 p-2">
+                {developerMode && (
+                  <button
+                    onClick={onToggleInspector}
+                    className="group flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-gray-400 hover:bg-white/5 hover:text-white"
+                    title="Toggle Inspector"
+                  >
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      strokeWidth={1.5}
+                      stroke="currentColor"
+                      className="h-5 w-5"
+                    >
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M17.25 6.75L22.5 12l-5.25 5.25m-10.5 0L1.5 12l5.25-5.25m7.5-3l-4.5 16.5" />
+                    </svg>
+                    <span className="opacity-0 transition-opacity group-hover:opacity-100">
+                      Inspector
+                    </span>
+                  </button>
+                )}
+
                 <button
                   onClick={onOpenSettings}
                   className="p-2 text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-zinc-800 rounded-lg transition-colors"

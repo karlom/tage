@@ -41,6 +41,13 @@ export const EMBEDDING_PROVIDERS: EmbeddingProvider[] = [
     dimensions: 1024,
   },
   {
+    id: 'ucloud',
+    name: 'UCloud ModelVerse',
+    apiUrl: 'https://api.modelverse.cn/v1/embeddings',
+    model: 'text-embedding-3-large',
+    dimensions: 3072,
+  },
+  {
     id: 'openai',
     name: 'OpenAI',
     apiUrl: 'https://api.openai.com/v1/embeddings',
@@ -334,8 +341,6 @@ export async function ensureMemoryEmbeddings(): Promise<Memory[]> {
     return memories;
   }
 
-  console.log(`Generating embeddings for ${needsEmbedding.length} memories...`);
-
   // 批量生成嵌入
   for (const memory of needsEmbedding) {
     try {
@@ -343,7 +348,6 @@ export async function ensureMemoryEmbeddings(): Promise<Memory[]> {
       if (embedding) {
         // 更新记忆的嵌入
         updateMemoryEmbedding(memory.id, embedding);
-        console.log(`Embedding generated for memory: ${memory.id.slice(0, 8)}...`);
       }
     } catch (error) {
       console.error(`Failed to generate embedding for memory ${memory.id}:`, error);

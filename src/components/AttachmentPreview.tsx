@@ -1,9 +1,12 @@
-import { X, FileText, Image as ImageIcon, File } from 'lucide-react';
+import { X, FileText, Image as ImageIcon, File, Music, Video, AlertTriangle } from 'lucide-react';
+import { type ModelCapabilities } from '@/services/storage';
+import { isFormatSupported } from '@/services/fileFormats';
 
 interface AttachmentPreviewProps {
   attachments: FileAttachment[];
   onRemove: (id: string) => void;
   compact?: boolean;
+  capabilities?: ModelCapabilities; // 可选的模型能力，用于检查附件是否支持
 }
 
 // 格式化文件大小
@@ -18,19 +21,33 @@ function getFileIcon(type: string, mimeType: string) {
   if (type === 'image') {
     return <ImageIcon className="w-4 h-4" />;
   }
+  if (type === 'audio') {
+    return <Music className="w-4 h-4 text-purple-500" />;
+  }
+  if (type === 'video') {
+    return <Video className="w-4 h-4 text-pink-500" />;
+  }
   if (mimeType === 'application/pdf') {
     return <FileText className="w-4 h-4 text-red-500" />;
   }
-  if (mimeType.startsWith('text/')) {
+  if (mimeType.startsWith('text/') || mimeType.includes('word')) {
     return <FileText className="w-4 h-4 text-blue-500" />;
   }
   return <File className="w-4 h-4" />;
+}
+
+// 检查附件是否被当前模型支持
+function isAttachmentSupported(attachment: FileAttachment, capabilities?: ModelCapabilities): boolean {
+  if (!capabilities) return true; // 没有能力信息时，假设支持
+  const ext = attachment.name.split('.').pop()?.toLowerCase() || '';
+  return isFormatSupported(ext, capabilities);
 }
 
 export default function AttachmentPreview({
   attachments,
   onRemove,
   compact = false,
+  capabilities,
 }: AttachmentPreviewProps) {
   if (attachments.length === 0) {
     return null;
@@ -40,31 +57,41 @@ export default function AttachmentPreview({
     // 紧凑模式 - 用于输入框上方显示
     return (
       <div className="flex flex-wrap gap-2 p-2 bg-gray-50 dark:bg-zinc-800 rounded-t-lg border-b border-gray-200 dark:border-zinc-700">
-        {attachments.map((attachment) => (
-          <div
-            key={attachment.id}
-            className="flex items-center gap-2 px-2 py-1 bg-white dark:bg-zinc-900 rounded border border-gray-200 dark:border-zinc-700 text-sm"
-          >
-            {attachment.type === 'image' ? (
-              <img
-                src={attachment.dataUrl}
-                alt={attachment.name}
-                className="w-6 h-6 object-cover rounded"
-              />
-            ) : (
-              getFileIcon(attachment.type, attachment.mimeType)
-            )}
-            <span className="max-w-[100px] truncate text-gray-700 dark:text-gray-300">
-              {attachment.name}
-            </span>
-            <button
-              onClick={() => onRemove(attachment.id)}
-              className="p-0.5 hover:bg-gray-100 dark:hover:bg-zinc-800 rounded"
+        {attachments.map((attachment) => {
+          const supported = isAttachmentSupported(attachment, capabilities);
+          return (
+            <div
+              key={attachment.id}
+              className={`flex items-center gap-2 px-2 py-1 bg-white dark:bg-zinc-900 rounded border text-sm ${supported
+                ? 'border-gray-200 dark:border-zinc-700'
+                : 'border-orange-300 dark:border-orange-600'
+                }`}
+              title={supported ? undefined : '当前模型可能不支持此文件类型'}
             >
-              <X className="w-3 h-3 text-gray-400 hover:text-gray-600" />
-            </button>
-          </div>
-        ))}
+              {!supported && (
+                <AlertTriangle className="w-3 h-3 text-orange-500 flex-shrink-0" />
+              )}
+              {attachment.type === 'image' ? (
+                <img
+                  src={attachment.dataUrl}
+                  alt={attachment.name}
+                  className="w-6 h-6 object-cover rounded"
+                />
+              ) : (
+                getFileIcon(attachment.type, attachment.mimeType)
+              )}
+              <span className={`max-w-[100px] truncate ${supported ? 'text-gray-700 dark:text-gray-300' : 'text-orange-600 dark:text-orange-400'}`}>
+                {attachment.name}
+              </span>
+              <button
+                onClick={() => onRemove(attachment.id)}
+                className="p-0.5 hover:bg-gray-100 dark:hover:bg-zinc-800 rounded"
+              >
+                <X className="w-3 h-3 text-gray-400 hover:text-gray-600" />
+              </button>
+            </div>
+          );
+        })}
       </div>
     );
   }

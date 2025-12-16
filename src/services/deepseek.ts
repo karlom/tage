@@ -19,6 +19,8 @@ import {
   generateToolDefinitions,
 } from './tools';
 
+import { addActivityLog } from './activityLog';
+
 // 重新导出工具相关类型
 export type { ToolCall, ToolResult };
 
@@ -26,9 +28,9 @@ export type { ToolCall, ToolResult };
 export type MessageContent =
   | string
   | Array<
-      | { type: 'text'; text: string }
-      | { type: 'image_url'; image_url: { url: string; detail?: 'auto' | 'low' | 'high' } }
-    >;
+    | { type: 'text'; text: string }
+    | { type: 'image_url'; image_url: { url: string; detail?: 'auto' | 'low' | 'high' } }
+  >;
 
 export interface ChatCompletionMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -62,6 +64,10 @@ export interface ChatCompletionOptions {
   incognitoMode?: boolean;
   // RAG 系统提示
   systemPrompt?: string;
+  // 取消信号
+  abortSignal?: AbortSignal;
+  // 会话 ID（用于 Inspector 活动日志）
+  sessionId?: string;
 }
 
 // 工具调用状态
@@ -81,6 +87,8 @@ export interface UsageData {
 export interface StreamCallbacks {
   onStart?: () => void;
   onToken?: (token: string) => void;
+  onContent?: (content: string) => void; // New callback
+  onReasoning?: (content: string) => void; // New callback
   onFirstToken?: () => void;  // 首个 token 回调
   onComplete?: (fullContent: string) => void;
   onError?: (error: Error) => void;
@@ -182,12 +190,12 @@ const isDev = import.meta.env.DEV;
 function getApiEndpoint(baseUrl: string, providerId: string): string {
   // 移除末尾的斜杠
   let url = baseUrl.replace(/\/+$/, '');
-  
+
   // 如果已经包含 /chat/completions 或 /messages，直接返回原始 URL
   if (url.endsWith('/chat/completions') || url.endsWith('/messages')) {
     return url;
   }
-  
+
   // 自定义提供商 - 直接使用配置的 URL
   if (providerId.startsWith('custom-')) {
     // 如果以 /v1 结尾，添加 /chat/completions
@@ -197,7 +205,7 @@ function getApiEndpoint(baseUrl: string, providerId: string): string {
     // 否则直接添加 /chat/completions
     return `${url}/chat/completions`;
   }
-  
+
   // 在开发环境中对内置提供商使用代理以避免 CORS 问题
   if (isDev) {
     const proxyMap: Record<string, string> = {
@@ -206,18 +214,18 @@ function getApiEndpoint(baseUrl: string, providerId: string): string {
       'anthropic': '/api/anthropic/v1/messages',
       'openrouter': '/api/openrouter/api/v1/chat/completions',
     };
-    
+
     if (proxyMap[providerId]) {
       return proxyMap[providerId];
     }
   }
-  
+
   // DeepSeek API 不需要 /v1 前缀
   if (providerId === 'deepseek' || url.includes('deepseek.com')) {
     url = url.replace(/\/v1$/, '');
     return `${url}/chat/completions`;
   }
-  
+
   // Anthropic 使用 /messages 端点
   if (providerId === 'anthropic' || url.includes('anthropic.com')) {
     if (url.endsWith('/v1')) {
@@ -225,12 +233,12 @@ function getApiEndpoint(baseUrl: string, providerId: string): string {
     }
     return `${url}/v1/messages`;
   }
-  
+
   // OpenAI 兼容的 API
   if (url.endsWith('/v1')) {
     return `${url}/chat/completions`;
   }
-  
+
   // 默认添加 /chat/completions
   return `${url}/chat/completions`;
 }
@@ -243,34 +251,33 @@ export async function streamChatCompletion(
 ): Promise<void> {
   const providerId = options.providerId || 'deepseek';
   const provider = getProviderById(providerId);
-  
-  console.log('Stream request - providerId:', providerId, 'provider:', provider?.name, 'baseUrl:', provider?.baseUrl);
-  
+
+
   if (!provider) {
     callbacks.onError?.(new Error(`未找到提供商: ${providerId}`));
     return;
   }
-  
+
   if (!provider.apiKey) {
     callbacks.onError?.(new Error(`请先在设置中配置 ${provider.name} 的 API Key`));
     return;
   }
-  
+
   // 确保 baseUrl 存在
-  const baseUrl = provider.baseUrl && provider.baseUrl.trim() !== '' 
-    ? provider.baseUrl 
+  const baseUrl = provider.baseUrl && provider.baseUrl.trim() !== ''
+    ? provider.baseUrl
     : 'https://api.deepseek.com';
-    
+
   const apiEndpoint = getApiEndpoint(baseUrl, providerId);
   const firstEnabledModel = provider.models.find((m) => m.enabled)?.id;
   const model = options.model || firstEnabledModel || 'deepseek-chat';
-  
+
   // 生成工具定义
   let toolDefinitions: ToolDefinition[] = [];
   if (options.toolSelectionMode && options.toolSelectionMode !== 'none' && options.selectedTools && options.selectedTools.length > 0) {
     toolDefinitions = generateToolDefinitions(options.selectedTools.map(t => t.id));
   }
-  
+
   // 执行流式请求（可能需要多轮工具调用）
   await executeStreamWithToolCalls(
     messages,
@@ -286,8 +293,15 @@ export async function streamChatCompletion(
       providerId,
       providerName: provider.name,
       systemPrompt: options.systemPrompt,
+      abortSignal: options.abortSignal,
+      sessionId: options.sessionId,
     }
   );
+}
+
+// 简单的哈希函数用于比较工具调用
+function hashToolCall(toolCall: ToolCall): string {
+  return `${toolCall.function.name}:${toolCall.function.arguments}`;
 }
 
 // 内部函数：执行流式请求并处理工具调用
@@ -305,8 +319,11 @@ async function executeStreamWithToolCalls(
     providerId: string;
     providerName: string;
     systemPrompt?: string;
+    abortSignal?: AbortSignal;
+    sessionId?: string;
   },
-  depth: number = 0
+  depth: number = 0,
+  recentToolCalls: string[] = [] // 追踪最近的工具调用哈希，用于检测死循环
 ): Promise<void> {
   // 防止无限递归
   const MAX_TOOL_CALL_DEPTH = 5;
@@ -326,15 +343,46 @@ async function executeStreamWithToolCalls(
   // 添加用户/助手消息
   apiMessages.push(...convertMessages(messages));
 
+  // 检测是否是需要使用 max_completion_tokens 的模型
+  // 新版 OpenAI 模型（gpt-5.x、o1、o3、o4 等）要求使用 max_completion_tokens
+  const modelLower = config.model.toLowerCase();
+  const useMaxCompletionTokens =
+    modelLower.includes('gpt-5') ||
+    modelLower.includes('gpt-4.1') ||
+    modelLower.match(/^o[134]-/) !== null ||  // o1-, o3-, o4- 开头
+    modelLower.startsWith('o1') ||
+    modelLower.startsWith('o3') ||
+    modelLower.startsWith('o4');
+
+  // 检测是否是有 beta 限制的模型
+  // 这些模型的 temperature、top_p、n、presence_penalty、frequency_penalty 参数是固定的
+  const isBetaLimitedModel =
+    modelLower.includes('reasoner') ||  // DeepSeek Reasoner
+    modelLower.includes('r1') ||        // DeepSeek R1
+    modelLower.includes('o1') ||        // OpenAI o1 系列
+    modelLower.includes('o3') ||        // OpenAI o3 系列
+    modelLower.includes('gpt-5') ||     // OpenAI GPT-5 系列
+    modelLower.match(/^o[134]-/) !== null;  // o1-, o3-, o4- 开头
+
   // 构建请求体
   const requestBody: Record<string, unknown> = {
     model: config.model,
     messages: apiMessages,
-    temperature: config.temperature,
-    max_tokens: config.max_tokens,
     stream: true,
     stream_options: { include_usage: true },  // 请求包含用量信息
   };
+
+  // 只有非 beta 限制的模型才能设置 temperature
+  if (!isBetaLimitedModel) {
+    requestBody.temperature = config.temperature;
+  }
+
+  // 根据模型类型设置 token 限制参数
+  if (useMaxCompletionTokens) {
+    requestBody.max_completion_tokens = config.max_tokens;
+  } else {
+    requestBody.max_tokens = config.max_tokens;
+  }
 
   // 添加推理相关参数
   if (config.reasoningLevel && config.reasoningLevel !== 'off') {
@@ -352,21 +400,12 @@ async function executeStreamWithToolCalls(
     requestBody.tool_choice = 'auto';
   }
 
-  console.log('API Request:', {
-    providerId: config.providerId,
-    providerName: config.providerName,
-    endpoint: config.apiEndpoint,
-    model: config.model,
-    messageCount: messages.length,
-    toolsCount: config.toolDefinitions.length,
-    depth,
-  });
 
   try {
     if (depth === 0) {
       callbacks.onStart?.();
     }
-    
+
     const response = await fetch(config.apiEndpoint, {
       method: 'POST',
       headers: {
@@ -374,9 +413,9 @@ async function executeStreamWithToolCalls(
         'Authorization': `Bearer ${config.apiKey}`,
       },
       body: JSON.stringify(requestBody),
+      signal: config.abortSignal,
     });
 
-    console.log('API Response status:', response.status);
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -399,32 +438,32 @@ async function executeStreamWithToolCalls(
     const decoder = new TextDecoder();
     let fullContent = '';
     let buffer = '';
-    
+
     // 累积工具调用
     const toolCallsMap: Map<number, ToolCall> = new Map();
     let hasToolCalls = false;
-    
+
     // 首个 token 追踪
     let firstTokenReceived = false;
-    
+
     // 用量信息
     let usageData: UsageData | null = null;
 
     while (true) {
       const { done, value } = await reader.read();
-      
+
       if (done) {
         break;
       }
 
       buffer += decoder.decode(value, { stream: true });
-      
+
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
 
       for (const line of lines) {
         const trimmedLine = line.trim();
-        
+
         if (!trimmedLine || trimmedLine === 'data: [DONE]') {
           continue;
         }
@@ -433,10 +472,10 @@ async function executeStreamWithToolCalls(
           try {
             const jsonStr = trimmedLine.slice(6);
             const data = JSON.parse(jsonStr);
-            
+
             const choice = data.choices?.[0];
             const delta = choice?.delta;
-            
+
             // 处理文本内容
             if (delta?.content) {
               // 追踪首个 token
@@ -445,15 +484,21 @@ async function executeStreamWithToolCalls(
                 callbacks.onFirstToken?.();
               }
               fullContent += delta.content;
-              callbacks.onToken?.(delta.content);
+              callbacks.onToken?.(delta.content); // Keep onToken for backward compatibility if needed, or replace with onContent
+              callbacks.onContent?.(delta.content); // New callback for content
             }
-            
+
+            // 处理推理内容
+            if (delta?.reasoning_content) {
+              callbacks.onReasoning?.(delta.reasoning_content);
+            }
+
             // 处理工具调用
             if (delta?.tool_calls) {
               hasToolCalls = true;
               for (const toolCallDelta of delta.tool_calls) {
                 const index = toolCallDelta.index ?? 0;
-                
+
                 if (!toolCallsMap.has(index)) {
                   toolCallsMap.set(index, {
                     id: toolCallDelta.id || `call_${index}`,
@@ -464,9 +509,9 @@ async function executeStreamWithToolCalls(
                     },
                   });
                 }
-                
+
                 const toolCall = toolCallsMap.get(index)!;
-                
+
                 if (toolCallDelta.id) {
                   toolCall.id = toolCallDelta.id;
                 }
@@ -478,7 +523,7 @@ async function executeStreamWithToolCalls(
                 }
               }
             }
-            
+
             // 捕获用量信息（通常在最后一个 chunk 中）
             if (data.usage) {
               usageData = {
@@ -493,7 +538,7 @@ async function executeStreamWithToolCalls(
         }
       }
     }
-    
+
     // 调用用量回调
     if (usageData) {
       callbacks.onUsage?.(usageData);
@@ -502,11 +547,45 @@ async function executeStreamWithToolCalls(
     // 如果有工具调用，执行工具并继续对话
     if (hasToolCalls && toolCallsMap.size > 0) {
       const toolCalls = Array.from(toolCallsMap.values());
-      console.log('Tool calls detected:', toolCalls);
-      
+
+      // === 死循环检测 (Loop Detection) ===
+      const currentHashes = toolCalls.map(hashToolCall);
+      const isLooping = currentHashes.some(hash => {
+        // 检查最近 3 次调用中是否包含完全相同的调用
+        // 这是一种简单的启发式
+        return recentToolCalls.slice(-3).includes(hash);
+      });
+
+      if (isLooping) {
+        console.warn('⚠️ Loop detected! Injecting interrupt.');
+        // 记录警告日志
+        addActivityLog(config.sessionId || 'unknown', 'error', 'Loop detected: Agent is repeating identical tool calls.');
+
+        // 我们不执行这些工具，而是直接添加一个系统消息告诉它停止，并把控制权交还给 recursion
+        const loopWarningMessage: Message = {
+          id: crypto.randomUUID(),
+          role: 'system',
+          content: 'SYSTEM ALERT: You seem to be in a loop, repeating the exact same tool calls. Please initialize a new strategy. STOP using the same tool with the same arguments. Analyze why previous attempts failed.',
+          timestamp: Date.now(),
+        };
+
+        // 添加到消息历史并重新请求（不执行本次工具）
+        const newMessages = [...messages, loopWarningMessage];
+        await executeStreamWithToolCalls(newMessages, callbacks, config, depth + 1, [...recentToolCalls, ...currentHashes]);
+        return;
+      }
+
+      // 更新最近调用历史
+      const newRecentToolCalls = [...recentToolCalls, ...currentHashes].slice(-10); // 仅保留最近 10 个
+
       // 通知工具调用开始
       callbacks.onToolCallStart?.(toolCalls);
-      
+
+      // 记录工具调用日志
+      toolCalls.forEach(tc => {
+        addActivityLog(config.sessionId || 'unknown', 'tool_call', tc);
+      });
+
       // 执行工具调用
       const toolResults = await executeToolCalls(toolCalls, {
         onStart: (tc) => {
@@ -525,10 +604,15 @@ async function executeStreamWithToolCalls(
           });
         },
       });
-      
+
       // 通知工具调用完成
       callbacks.onToolCallComplete?.(toolResults);
-      
+
+      // 记录工具调用结果日志
+      toolResults.forEach(result => {
+        addActivityLog(config.sessionId || 'unknown', 'tool_result', result);
+      });
+
       // 构建新的消息列表，包含助手的工具调用和工具结果
       const assistantMessage: any = {
         id: crypto.randomUUID(),
@@ -537,24 +621,46 @@ async function executeStreamWithToolCalls(
         timestamp: Date.now(),
         tool_calls: toolCalls,
       };
-      
-      const toolResultMessages: any[] = toolResults.map((result) => ({
-        id: crypto.randomUUID(),
-        role: 'tool',
-        content: result.success ? result.result : `错误: ${result.error}`,
-        timestamp: Date.now(),
-        tool_call_id: result.toolCallId,
-      }));
-      
+
+      // === 错误恢复策略 (Error Recovery) ===
+      const toolResultMessages: any[] = toolResults.map((result) => {
+        let content = result.success ? result.result : `Error: ${result.error}`;
+
+        // 如果失败，追加指导提示
+        if (!result.success) {
+          content += `\n\n[SYSTEM ADVICE]: The tool execution failed. Please analyze the error message carefully. Do not simply retry with the exact same arguments unless you have fixed the issue. Consider using a different tool or asking the user for clarification.`;
+        }
+
+        return {
+          id: crypto.randomUUID(),
+          role: 'tool',
+          content: content,
+          timestamp: Date.now(),
+          tool_call_id: result.toolCallId,
+        };
+      });
+
       const newMessages = [...messages, assistantMessage, ...toolResultMessages];
-      
+
       // 递归调用，继续对话
-      await executeStreamWithToolCalls(newMessages, callbacks, config, depth + 1);
+      await executeStreamWithToolCalls(newMessages, callbacks, config, depth + 1, newRecentToolCalls);
     } else {
       // 没有工具调用，正常完成
       callbacks.onComplete?.(fullContent);
     }
   } catch (error) {
+    // 检查是否是用户主动中止的请求
+    const isAbortError = error instanceof Error && (
+      error.name === 'AbortError' ||
+      error.message.includes('aborted') ||
+      error.message.includes('abort') ||
+      error.message.includes('BodyStreamBuffer was aborted')
+    );
+
+    if (isAbortError) {
+      // 用户主动停止，静默处理，不显示错误
+      return;
+    }
     console.error('Stream error:', error);
     callbacks.onError?.(error instanceof Error ? error : new Error(String(error)));
   }
@@ -567,32 +673,63 @@ export async function chatCompletion(
 ): Promise<string> {
   const providerId = options.providerId || 'deepseek';
   const provider = getProviderById(providerId);
-  
+
   if (!provider) {
     throw new Error(`未找到提供商: ${providerId}`);
   }
-  
+
   if (!provider.apiKey) {
     throw new Error(`请先在设置中配置 ${provider.name} 的 API Key`);
   }
 
   // 确保 baseUrl 存在
-  const baseUrl = provider.baseUrl && provider.baseUrl.trim() !== '' 
-    ? provider.baseUrl 
+  const baseUrl = provider.baseUrl && provider.baseUrl.trim() !== ''
+    ? provider.baseUrl
     : 'https://api.deepseek.com';
-    
+
   const apiEndpoint = getApiEndpoint(baseUrl, providerId);
   // 获取第一个启用的模型，或使用默认模型
   const firstEnabledModel = provider.models.find((m) => m.enabled)?.id;
   const model = options.model || firstEnabledModel || 'deepseek-chat';
-  
-  const requestBody = {
+
+  // 检测是否是需要使用 max_completion_tokens 的模型
+  const modelLower = model.toLowerCase();
+  const useMaxCompletionTokens =
+    modelLower.includes('gpt-5') ||
+    modelLower.includes('gpt-4.1') ||
+    modelLower.match(/^o[134]-/) !== null ||
+    modelLower.startsWith('o1') ||
+    modelLower.startsWith('o3') ||
+    modelLower.startsWith('o4');
+
+  // 检测是否是有 beta 限制的模型
+  const isBetaLimitedModel =
+    modelLower.includes('reasoner') ||
+    modelLower.includes('r1') ||
+    modelLower.includes('o1') ||
+    modelLower.includes('o3') ||
+    modelLower.includes('gpt-5') ||     // OpenAI GPT-5 系列
+    modelLower.match(/^o[134]-/) !== null;
+
+  const maxTokens = options.max_tokens ?? 4096;
+
+  const requestBody: Record<string, unknown> = {
     model,
     messages: convertMessages(messages),
-    temperature: options.temperature ?? 0.7,
-    max_tokens: options.max_tokens ?? 4096,
     stream: false,
   };
+
+  // 只有非 beta 限制的模型才能设置 temperature
+  if (!isBetaLimitedModel) {
+    requestBody.temperature = options.temperature ?? 0.7;
+  }
+
+  // 根据模型类型设置 token 限制参数
+  if (useMaxCompletionTokens) {
+    requestBody.max_completion_tokens = maxTokens;
+  } else {
+    requestBody.max_tokens = maxTokens;
+  }
 
   const response = await fetch(apiEndpoint, {
     method: 'POST',
@@ -638,7 +775,7 @@ interface ApiModelInfo {
 // 获取 models 端点
 function getModelsEndpoint(baseUrl: string, providerId: string): string {
   let url = baseUrl.replace(/\/+$/, '');
-  
+
   // 在开发环境中使用代理
   if (isDev) {
     const proxyMap: Record<string, string> = {
@@ -646,23 +783,23 @@ function getModelsEndpoint(baseUrl: string, providerId: string): string {
       'openai': '/api/openai/v1/models',
       'openrouter': '/api/openrouter/api/v1/models',
     };
-    
+
     if (proxyMap[providerId]) {
       return proxyMap[providerId];
     }
   }
-  
+
   // DeepSeek
   if (providerId === 'deepseek' || url.includes('deepseek.com')) {
     url = url.replace(/\/v1$/, '');
     return `${url}/models`;
   }
-  
+
   // OpenAI 兼容的 API
   if (url.endsWith('/v1')) {
     return `${url}/models`;
   }
-  
+
   return `${url}/models`;
 }
 
@@ -670,7 +807,7 @@ function getModelsEndpoint(baseUrl: string, providerId: string): string {
 function inferModelCapabilities(modelId: string, apiCapabilities?: ApiModelInfo['capabilities']): ModelCapabilities {
   const id = modelId.toLowerCase();
   const capabilities: ModelCapabilities = {};
-  
+
   // 从 API 返回的能力信息
   if (apiCapabilities) {
     if (apiCapabilities.vision) {
@@ -680,13 +817,13 @@ function inferModelCapabilities(modelId: string, apiCapabilities?: ApiModelInfo[
       capabilities.functionCalling = true;
     }
   }
-  
+
   // 推理能力检测
-  if (id.includes('reasoner') || id.includes('o1') || id.includes('thinking') || 
-      id.includes('2.5-pro') || id.includes('2.5pro') || id.includes('r1')) {
+  if (id.includes('reasoner') || id.includes('o1') || id.includes('thinking') ||
+    id.includes('2.5-pro') || id.includes('2.5pro') || id.includes('r1')) {
     capabilities.reasoning = true;
   }
-  
+
   // 视觉能力检测
   if (!capabilities.vision && (
     id.includes('vision') || id.includes('4o') || id.includes('gpt-4-turbo') ||
@@ -695,17 +832,17 @@ function inferModelCapabilities(modelId: string, apiCapabilities?: ApiModelInfo[
   )) {
     capabilities.vision = true;
   }
-  
+
   // 工具调用能力检测
   if (!capabilities.functionCalling) {
     // 推理模型通常不支持工具调用
-    const isReasoningModel = id.includes('reasoner') || id.includes('o1-') || 
-                             id.includes('o1') || id.includes('r1');
+    const isReasoningModel = id.includes('reasoner') || id.includes('o1-') ||
+      id.includes('o1') || id.includes('r1');
     if (!isReasoningModel) {
       capabilities.functionCalling = true;
     }
   }
-  
+
   return capabilities;
 }
 
@@ -714,19 +851,19 @@ export async function fetchModelsFromProvider(
   providerId: string
 ): Promise<{ success: boolean; models?: ModelConfig[]; error?: string }> {
   const provider = getProviderById(providerId);
-  
+
   if (!provider) {
     return { success: false, error: `未找到提供商: ${providerId}` };
   }
-  
+
   if (!provider.apiKey) {
     return { success: false, error: `请先配置 ${provider.name} 的 API Key` };
   }
-  
+
   // Anthropic 不支持 /models 端点，使用预定义列表
   if (providerId === 'anthropic') {
-    return { 
-      success: true, 
+    return {
+      success: true,
       models: [
         { id: 'claude-3-opus-20240229', enabled: true, capabilities: { functionCalling: true, vision: true } },
         { id: 'claude-3-sonnet-20240229', enabled: true, capabilities: { functionCalling: true, vision: true } },
@@ -735,7 +872,7 @@ export async function fetchModelsFromProvider(
       ]
     };
   }
-  
+
   // Google Gemini 也使用预定义列表
   if (providerId === 'google') {
     return {
@@ -747,13 +884,13 @@ export async function fetchModelsFromProvider(
       ]
     };
   }
-  
-  const baseUrl = provider.baseUrl && provider.baseUrl.trim() !== '' 
-    ? provider.baseUrl 
+
+  const baseUrl = provider.baseUrl && provider.baseUrl.trim() !== ''
+    ? provider.baseUrl
     : 'https://api.deepseek.com';
-    
+
   const modelsEndpoint = getModelsEndpoint(baseUrl, providerId);
-  
+
   try {
     const response = await fetch(modelsEndpoint, {
       method: 'GET',
@@ -762,44 +899,43 @@ export async function fetchModelsFromProvider(
         'Content-Type': 'application/json',
       },
     });
-    
+
     if (!response.ok) {
       const errorText = await response.text();
       console.error('Models API Error:', errorText);
-      return { 
-        success: false, 
-        error: `获取模型列表失败: ${response.status}` 
+      return {
+        success: false,
+        error: `获取模型列表失败: ${response.status}`
       };
     }
-    
+
     const data = await response.json();
     const apiModels: ApiModelInfo[] = data.data || data.models || [];
-    
+
     // 过滤并转换模型列表
     const models: ModelConfig[] = apiModels
       .filter((m) => {
         // 过滤掉嵌入模型和其他非聊天模型
         const id = m.id.toLowerCase();
-        return !id.includes('embedding') && 
-               !id.includes('whisper') && 
-               !id.includes('tts') &&
-               !id.includes('dall-e') &&
-               !id.includes('moderation');
+        return !id.includes('embedding') &&
+          !id.includes('whisper') &&
+          !id.includes('tts') &&
+          !id.includes('dall-e') &&
+          !id.includes('moderation');
       })
       .map((m) => ({
         id: m.id,
         enabled: true,
         capabilities: inferModelCapabilities(m.id, m.capabilities),
       }));
-    
-    console.log(`Fetched ${models.length} models from ${provider.name}`);
-    
+
+
     return { success: true, models };
   } catch (error) {
     console.error('Failed to fetch models:', error);
-    return { 
-      success: false, 
-      error: error instanceof Error ? error.message : '获取模型列表失败' 
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : '获取模型列表失败'
     };
   }
 }
@@ -809,23 +945,23 @@ export async function updateProviderModels(
   providerId: string
 ): Promise<{ success: boolean; error?: string }> {
   const result = await fetchModelsFromProvider(providerId);
-  
+
   if (!result.success || !result.models) {
     return { success: false, error: result.error };
   }
-  
+
   // 获取当前提供商列表
   const providers = getProviders();
   const index = providers.findIndex((p) => p.id === providerId);
-  
+
   if (index === -1) {
     return { success: false, error: '提供商不存在' };
   }
-  
+
   // 合并新旧模型列表，保留用户的启用状态
   const existingModels = providers[index].models;
   const existingModelMap = new Map(existingModels.map((m) => [m.id, m]));
-  
+
   const mergedModels = result.models.map((newModel) => {
     const existing = existingModelMap.get(newModel.id);
     if (existing) {
@@ -837,14 +973,14 @@ export async function updateProviderModels(
     }
     return newModel;
   });
-  
+
   // 更新提供商
   providers[index] = {
     ...providers[index],
     models: mergedModels,
   };
-  
+
   saveProviders(providers);
-  
+
   return { success: true };
 }

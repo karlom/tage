@@ -4,11 +4,11 @@ import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 import { Select } from '@/components/ui/select';
 import { Eye, EyeOff, ExternalLink } from 'lucide-react';
-import { 
-  getSearchApiConfig, 
-  saveSearchApiConfig, 
+import {
+  getSearchApiConfig,
+  saveSearchApiConfig,
   type SearchApiConfig,
-  type SearchApiProvider 
+  type SearchApiProvider
 } from '@/services/storage';
 
 export default function NetworkSettings() {
@@ -66,6 +66,13 @@ export default function NetworkSettings() {
           freeTier: '100 次/天 (约 3,000 次/月)',
           pricing: '$5/1,000 次',
           url: 'https://developers.google.com/custom-search/v1/overview',
+        };
+      case 'tavily':
+        return {
+          name: 'Tavily Search API',
+          freeTier: '1,000 次/月 (推荐⭐)',
+          pricing: '$0.008/次 按量付费',
+          url: 'https://tavily.com',
         };
       default:
         return null;
@@ -126,6 +133,7 @@ export default function NetworkSettings() {
               onChange={(e) => handleProviderChange(e.target.value as SearchApiProvider)}
             >
               <option value="none">不使用搜索 API</option>
+              <option value="tavily">Tavily Search API (推荐)</option>
               <option value="serpapi">SerpAPI</option>
               <option value="brave">Brave Search API</option>
               <option value="google">Google Custom Search API</option>
@@ -186,7 +194,21 @@ export default function NetworkSettings() {
                   </button>
                 </div>
                 <p className="text-xs text-gray-500 dark:text-gray-400">
-                  {config.provider === 'serpapi' ? (
+                  {config.provider === 'tavily' ? (
+                    <>
+                      在{' '}
+                      <a
+                        href="https://tavily.com"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-blue-600 dark:text-blue-400 hover:underline inline-flex items-center gap-1"
+                      >
+                        https://tavily.com
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
+                      {' '}注册并获取 API Key（免费 1,000 次/月）
+                    </>
+                  ) : config.provider === 'serpapi' ? (
                     <>
                       在{' '}
                       <a

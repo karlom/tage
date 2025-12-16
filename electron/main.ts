@@ -5,8 +5,9 @@ import * as fs from 'fs';
 import Store from 'electron-store';
 import { execFile, exec } from 'child_process';
 
-// pdf-parse 将在需要时动态导入
+// pdf-parse 和 mammoth 将在需要时动态导入
 let PDFParse: any = null;
+let mammoth: any = null;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -145,45 +146,146 @@ interface FileAttachment {
   textContent?: string;  // 文档的提取文本内容
 }
 
-// 支持的文件类型
-const SUPPORTED_IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
-const SUPPORTED_DOCUMENT_EXTENSIONS = ['pdf', 'txt', 'md'];
+// 模型能力接口（与前端保持同步）
+interface ModelCapabilities {
+  reasoning?: boolean;
+  functionCalling?: boolean;
+  vision?: boolean;
+  audio?: boolean;
+  video?: boolean;
+  documents?: boolean;
+}
+
+// 文件格式分类
+type FileCategory = 'image' | 'audio' | 'video' | 'document';
+
+// 文件格式定义
+interface FileFormatDef {
+  extension: string;
+  mimeType: string;
+  category: FileCategory;
+  requiredCapability: keyof ModelCapabilities;
+}
+
+// 所有支持的文件格式
+const ALL_FILE_FORMATS: FileFormatDef[] = [
+  // 图片格式
+  { extension: 'jpg', mimeType: 'image/jpeg', category: 'image', requiredCapability: 'vision' },
+  { extension: 'jpeg', mimeType: 'image/jpeg', category: 'image', requiredCapability: 'vision' },
+  { extension: 'png', mimeType: 'image/png', category: 'image', requiredCapability: 'vision' },
+  { extension: 'gif', mimeType: 'image/gif', category: 'image', requiredCapability: 'vision' },
+  { extension: 'webp', mimeType: 'image/webp', category: 'image', requiredCapability: 'vision' },
+  { extension: 'heic', mimeType: 'image/heic', category: 'image', requiredCapability: 'vision' },
+  { extension: 'heif', mimeType: 'image/heif', category: 'image', requiredCapability: 'vision' },
+
+  // 音频格式
+  { extension: 'mp3', mimeType: 'audio/mpeg', category: 'audio', requiredCapability: 'audio' },
+  { extension: 'wav', mimeType: 'audio/wav', category: 'audio', requiredCapability: 'audio' },
+  { extension: 'm4a', mimeType: 'audio/m4a', category: 'audio', requiredCapability: 'audio' },
+  { extension: 'flac', mimeType: 'audio/flac', category: 'audio', requiredCapability: 'audio' },
+  { extension: 'aac', mimeType: 'audio/aac', category: 'audio', requiredCapability: 'audio' },
+  { extension: 'ogg', mimeType: 'audio/ogg', category: 'audio', requiredCapability: 'audio' },
+
+  // 视频格式
+  { extension: 'mp4', mimeType: 'video/mp4', category: 'video', requiredCapability: 'video' },
+  { extension: 'webm', mimeType: 'video/webm', category: 'video', requiredCapability: 'video' },
+  { extension: 'mov', mimeType: 'video/quicktime', category: 'video', requiredCapability: 'video' },
+
+  // 文档格式
+  { extension: 'pdf', mimeType: 'application/pdf', category: 'document', requiredCapability: 'documents' },
+  { extension: 'docx', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', category: 'document', requiredCapability: 'documents' },
+  { extension: 'doc', mimeType: 'application/msword', category: 'document', requiredCapability: 'documents' },
+  { extension: 'txt', mimeType: 'text/plain', category: 'document', requiredCapability: 'documents' },
+  { extension: 'md', mimeType: 'text/markdown', category: 'document', requiredCapability: 'documents' },
+  { extension: 'csv', mimeType: 'text/csv', category: 'document', requiredCapability: 'documents' },
+];
+
+// 类别显示名称
+const CATEGORY_LABELS: Record<FileCategory, string> = {
+  image: '图片',
+  audio: '音频',
+  video: '视频',
+  document: '文档',
+};
+
+// 根据模型能力获取支持的格式
+function getSupportedFormats(capabilities?: ModelCapabilities): FileFormatDef[] {
+  if (!capabilities) {
+    // 如果没有能力信息，默认只支持文档（通过文本提取）
+    return ALL_FILE_FORMATS.filter(f => f.category === 'document');
+  }
+
+  return ALL_FILE_FORMATS.filter(format => {
+    const cap = format.requiredCapability;
+    return capabilities[cap] === true;
+  });
+}
 
 // 获取 MIME 类型
 function getMimeType(ext: string): string {
-  const mimeTypes: Record<string, string> = {
-    jpg: 'image/jpeg',
-    jpeg: 'image/jpeg',
-    png: 'image/png',
-    gif: 'image/gif',
-    webp: 'image/webp',
-    pdf: 'application/pdf',
-    txt: 'text/plain',
-    md: 'text/markdown',
-  };
-  return mimeTypes[ext.toLowerCase()] || 'application/octet-stream';
+  const format = ALL_FILE_FORMATS.find(f => f.extension.toLowerCase() === ext.toLowerCase());
+  return format?.mimeType || 'application/octet-stream';
 }
 
-// 文件选择 IPC
-ipcMain.handle('select-files', async () => {
+// 获取文件类别
+function getFileCategory(ext: string): FileCategory | 'unknown' {
+  const format = ALL_FILE_FORMATS.find(f => f.extension.toLowerCase() === ext.toLowerCase());
+  return format?.category || 'unknown';
+}
+
+// 根据模型能力生成文件对话框过滤器
+function generateFileFilters(capabilities?: ModelCapabilities): { name: string; extensions: string[] }[] {
+  const formats = getSupportedFormats(capabilities);
+  const filters: { name: string; extensions: string[] }[] = [];
+
+  // 按类别分组
+  const categories = new Map<FileCategory, string[]>();
+  for (const format of formats) {
+    if (!categories.has(format.category)) {
+      categories.set(format.category, []);
+    }
+    categories.get(format.category)!.push(format.extension);
+  }
+
+  // 生成每个类别的过滤器
+  for (const [category, extensions] of categories) {
+    filters.push({
+      name: CATEGORY_LABELS[category],
+      extensions,
+    });
+  }
+
+  // 添加"所有支持的格式"选项
+  if (filters.length > 1) {
+    const allExtensions = formats.map(f => f.extension);
+    filters.unshift({
+      name: '所有支持的格式',
+      extensions: allExtensions,
+    });
+  }
+
+  // 如果没有任何支持的格式，至少返回文档格式
+  if (filters.length === 0) {
+    filters.push({
+      name: '文档',
+      extensions: ['pdf', 'docx', 'doc', 'txt', 'md'],
+    });
+  }
+
+  return filters;
+}
+
+// 文件选择 IPC（接受模型能力参数）
+ipcMain.handle('select-files', async (_, capabilities?: ModelCapabilities) => {
   if (!mainWindow) return [];
+
+  // 根据能力生成过滤器
+  const filters = generateFileFilters(capabilities);
+  console.log('File filters based on capabilities:', capabilities, filters);
 
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openFile', 'multiSelections'],
-    filters: [
-      {
-        name: 'Images',
-        extensions: SUPPORTED_IMAGE_EXTENSIONS,
-      },
-      {
-        name: 'Documents',
-        extensions: SUPPORTED_DOCUMENT_EXTENSIONS,
-      },
-      {
-        name: 'All Supported',
-        extensions: [...SUPPORTED_IMAGE_EXTENSIONS, ...SUPPORTED_DOCUMENT_EXTENSIONS],
-      },
-    ],
+    filters,
   });
 
   if (result.canceled || result.filePaths.length === 0) {
@@ -199,9 +301,11 @@ ipcMain.handle('select-files', async () => {
       const mimeType = getMimeType(ext);
       const stats = fs.statSync(filePath);
 
-      // 限制文件大小（10MB）
-      if (stats.size > 10 * 1024 * 1024) {
-        console.warn(`File too large: ${fileName}`);
+      // 根据文件类型限制大小
+      const category = getFileCategory(ext);
+      const maxSize = category === 'video' ? 50 * 1024 * 1024 : 10 * 1024 * 1024; // 视频 50MB，其他 10MB
+      if (stats.size > maxSize) {
+        console.warn(`File too large: ${fileName} (${stats.size} bytes, max ${maxSize} bytes)`);
         continue;
       }
 
@@ -210,12 +314,7 @@ ipcMain.handle('select-files', async () => {
       const dataUrl = `data:${mimeType};base64,${base64}`;
 
       // 确定文件类型
-      let fileType = 'unknown';
-      if (SUPPORTED_IMAGE_EXTENSIONS.includes(ext)) {
-        fileType = 'image';
-      } else if (SUPPORTED_DOCUMENT_EXTENSIONS.includes(ext)) {
-        fileType = 'document';
-      }
+      const fileType = getFileCategory(ext);
 
       // 对文档类型，解析文本内容
       let textContent: string | undefined;
@@ -233,11 +332,23 @@ ipcMain.handle('select-files', async () => {
             console.log(`PDF parsed: ${fileName}, ${textContent?.length || 0} chars`);
           } catch (pdfError) {
             console.warn(`PDF parse failed: ${fileName}`, pdfError);
-            // PDF 解析失败时，设置为空字符串而不是 undefined
+            textContent = '';
+          }
+        } else if (ext === 'docx' || ext === 'doc') {
+          try {
+            // 动态导入 mammoth
+            if (!mammoth) {
+              mammoth = await import('mammoth');
+            }
+            const result = await mammoth.extractRawText({ buffer: buffer });
+            textContent = result.value;
+            console.log(`Word parsed: ${fileName}, ${textContent?.length || 0} chars`);
+          } catch (wordError) {
+            console.warn(`Word parse failed: ${fileName}`, wordError);
             textContent = '';
           }
         } else {
-          // txt, md 直接读取
+          // txt, md, csv 直接读取
           textContent = buffer.toString('utf-8');
         }
       }

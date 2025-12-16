@@ -118,6 +118,20 @@ export default function GeneralSettings() {
               onChange={(e) => handleChange('minimizeToTray', e.target.checked)}
             />
           </div>
+
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5">
+              <Label htmlFor="developerMode">开发者模式</Label>
+              <p className="text-sm text-gray-500 dark:text-gray-400">
+                启用后显示 Inspector 等开发工具
+              </p>
+            </div>
+            <Switch
+              id="developerMode"
+              checked={settings.developerMode}
+              onChange={(e) => handleChange('developerMode', e.target.checked)}
+            />
+          </div>
         </div>
       </div>
     </div>

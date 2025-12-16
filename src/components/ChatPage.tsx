@@ -23,11 +23,13 @@ import {
   FileText,
   GitBranch,
   Trash2,
+  Square,
 } from 'lucide-react';
 import { streamChatCompletion, type ToolCall, type ToolResult } from '@/services/deepseek';
 import { getToolDisplayName } from '@/services/tools';
 import { buildContextWithMemories, extractAndSaveMemories, type ContextBuildResult } from '@/services/contextInjection';
 import { getPersonaPrompt } from '@/services/persona';
+import { addActivityLog } from '@/services/activityLog';
 import {
   type Message,
   type ReasoningLevel,
@@ -37,6 +39,7 @@ import {
   type ToolCategory,
   type ToolCallRecord,
   type UsageInfo,
+  type QuickCommand,
   getChatSession,
   createChatSession,
   addMessageToSession,
@@ -48,9 +51,13 @@ import {
   getTools,
   getToolCategories,
   getChatSettings,
+  getQuickCommands,
 } from '@/services/storage';
 import MarkdownRenderer from './MarkdownRenderer';
 import AttachmentPreview, { MessageAttachments } from './AttachmentPreview';
+
+// 导入图标资源
+import tageIcon from '/icon.png';
 
 // 懒加载 MarkdownRenderer 用于长消息 (将在 Stage 4 实现)
 // const LazyMarkdownRenderer = lazy(() => import('./MarkdownRenderer'));
@@ -143,12 +150,12 @@ const ToolCallCards = memo(function ToolCallCards({ toolCalls, messageId }: Tool
         const cardId = `${messageId}-${tc.id}`;
         const isExpanded = expandedCards.has(cardId);
         const duration = tc.duration ? (tc.duration / 1000).toFixed(1) : null;
-        const resultSize = tc.result 
-          ? (new Blob([tc.result]).size / 1024).toFixed(1) 
+        const resultSize = tc.result
+          ? (new Blob([tc.result]).size / 1024).toFixed(1)
           : null;
 
         return (
-          <div 
+          <div
             key={tc.id}
             className="bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-700 rounded-lg overflow-hidden"
           >
@@ -161,7 +168,7 @@ const ToolCallCards = memo(function ToolCallCards({ toolCalls, messageId }: Tool
               <span className="font-medium text-sm">
                 {getToolDisplayName(tc.name)}
               </span>
-              
+
               {/* 状态标签 */}
               {tc.success ? (
                 <span className="px-2 py-0.5 text-xs bg-green-100 dark:bg-green-900/50 text-green-600 dark:text-green-400 rounded flex items-center gap-1">
@@ -174,7 +181,7 @@ const ToolCallCards = memo(function ToolCallCards({ toolCalls, messageId }: Tool
                   Error
                 </span>
               )}
-              
+
               {/* 耗时 */}
               {duration && (
                 <span className="flex items-center gap-1 text-xs text-gray-400">
@@ -185,13 +192,13 @@ const ToolCallCards = memo(function ToolCallCards({ toolCalls, messageId }: Tool
                   {duration} s
                 </span>
               )}
-              
+
               <div className="flex-1" />
-              
+
               {/* 展开/折叠箭头 */}
               <ChevronDown className={`w-4 h-4 text-gray-400 transition-transform flex-shrink-0 ${isExpanded ? 'rotate-180' : ''}`} />
             </button>
-            
+
             {/* 展开的详情 */}
             {isExpanded && (
               <div className="border-t border-gray-100 dark:border-zinc-800">
@@ -202,17 +209,17 @@ const ToolCallCards = memo(function ToolCallCards({ toolCalls, messageId }: Tool
                     {tc.arguments || '{}'}
                   </div>
                 </div>
-                
+
                 {/* 结果部分 */}
                 <div className="px-4 py-3 border-t border-gray-100 dark:border-zinc-800">
                   <div className="text-xs font-medium text-teal-600 dark:text-teal-400 mb-2">RESULT</div>
                   <div className="bg-gray-50 dark:bg-zinc-800/50 rounded p-3 text-xs font-mono text-gray-700 dark:text-gray-300 overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap break-all">
-                    {tc.success 
+                    {tc.success
                       ? (tc.result?.slice(0, 2000) || '') + ((tc.result?.length || 0) > 2000 ? '...' : '')
                       : `Error: ${tc.error}`
                     }
                   </div>
-                  
+
                   {/* 底部信息 */}
                   <div className="flex items-center justify-between mt-3 text-xs text-gray-400">
                     {resultSize && tc.success && (
@@ -501,7 +508,7 @@ export default function ChatPage({
   const [showModelSelector, setShowModelSelector] = useState(false);
   const [availableModels, setAvailableModels] = useState<ModelOption[]>([]);
   const [selectedModel, setSelectedModel] = useState<ModelOption | null>(null);
-  
+
   // 新增：推理强度、工具选择、隐身模式状态
   const [reasoningLevel, setReasoningLevel] = useState<ReasoningLevel>('medium');
   const [showReasoningSelector, setShowReasoningSelector] = useState(false);
@@ -517,6 +524,9 @@ export default function ChatPage({
   // 文件附件状态
   const [attachments, setAttachments] = useState<FileAttachment[]>([]);
 
+  // 推理内容展开状态
+  const [expandedReasoning, setExpandedReasoning] = useState<Set<string>>(new Set());
+
   // 工具调用状态
   const [activeToolCalls, setActiveToolCalls] = useState<ToolCallState[]>([]);
   const [showToolCallProgress, setShowToolCallProgress] = useState(false);
@@ -525,54 +535,65 @@ export default function ChatPage({
   const firstTokenTimeRef = useRef<number>(0);
   const completedToolCallsRef = useRef<ToolCallRecord[]>([]);
   const usageInfoRef = useRef<UsageInfo | null>(null);
+  const reasoningContentRef = useRef<string>(''); // 累积推理内容
   const sendLockRef = useRef(false); // 防止一次输入触发多次发送
   const isNewSessionRef = useRef(false); // 标记是否刚创建新会话，防止 useEffect 重复加载
-  
+  const abortControllerRef = useRef<AbortController | null>(null); // 用于取消生成
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const modelSelectorRef = useRef<HTMLDivElement>(null);
   const reasoningSelectorRef = useRef<HTMLDivElement>(null);
   const toolsSelectorRef = useRef<HTMLDivElement>(null);
 
+  // 快捷指令状态
+  const [quickCommands, setQuickCommands] = useState<QuickCommand[]>([]);
+  const [showCommandSuggestions, setShowCommandSuggestions] = useState(false);
+  const [commandFilter, setCommandFilter] = useState('');
+  const [selectedCommandIndex, setSelectedCommandIndex] = useState(0);
+  const commandSuggestionsRef = useRef<HTMLDivElement>(null);
+
+
+
   // 加载可用模型（包含能力信息）
   useEffect(() => {
     const loadModels = () => {
       const modelsData = getAvailableModelsWithCapabilities();
       const options: ModelOption[] = [];
-      
+
       modelsData.forEach(({ providerId, providerName, models }) => {
         models.forEach((model) => {
-          options.push({ 
-            providerId, 
-            providerName, 
+          options.push({
+            providerId,
+            providerName,
             model: model.id,
             capabilities: model.capabilities,
           });
         });
       });
-      
+
       setAvailableModels(options);
-      
+
       // 设置默认选中的模型
       setSelectedModel((currentSelected) => {
         if (options.length === 0) {
           return null;
         }
-        
+
         // 如果没有选中任何模型，选择第一个
         if (!currentSelected) {
           return options[0];
         }
-        
+
         // 检查当前选中的模型是否仍然可用
         const stillAvailable = options.some(
           (m) => m.providerId === currentSelected.providerId && m.model === currentSelected.model
         );
-        
+
         if (!stillAvailable) {
           return options[0];
         }
-        
+
         // 更新能力信息
         const updated = options.find(
           (m) => m.providerId === currentSelected.providerId && m.model === currentSelected.model
@@ -580,16 +601,16 @@ export default function ChatPage({
         return updated || currentSelected;
       });
     };
-    
+
     loadModels();
-    
+
     // 监听存储变化以更新模型列表
     const handleStorageChange = () => loadModels();
     const handleProvidersUpdated = () => loadModels();
-    
+
     window.addEventListener('storage', handleStorageChange);
     window.addEventListener('providers-updated', handleProvidersUpdated);
-    
+
     return () => {
       window.removeEventListener('storage', handleStorageChange);
       window.removeEventListener('providers-updated', handleProvidersUpdated);
@@ -603,27 +624,41 @@ export default function ChatPage({
       setToolCategories(getToolCategories());
       const memorySettings = getMemorySettings();
       setMemoryEnabled(memorySettings.enabled);
-      
+
       // 初始化选中的工具（默认全选）
       const allToolIds = getTools().filter(t => t.enabled).map(t => t.id);
       setSelectedTools(new Set(allToolIds));
     };
-    
+
     loadToolsAndMemory();
-    
+
     const handleToolsUpdated = () => loadToolsAndMemory();
     const handleMemoryUpdated = () => {
       const memorySettings = getMemorySettings();
       setMemoryEnabled(memorySettings.enabled);
     };
-    
+
     window.addEventListener('tools-updated', handleToolsUpdated);
     window.addEventListener('memory-settings-updated', handleMemoryUpdated);
-    
+
     return () => {
       window.removeEventListener('tools-updated', handleToolsUpdated);
       window.removeEventListener('memory-settings-updated', handleMemoryUpdated);
     };
+  }, []);
+
+  // 加载快捷指令
+  useEffect(() => {
+    const loadCommands = () => {
+      setQuickCommands(getQuickCommands());
+    };
+
+    loadCommands();
+
+    const handleCommandsUpdated = () => loadCommands();
+    window.addEventListener('quick-commands-updated', handleCommandsUpdated);
+
+    return () => window.removeEventListener('quick-commands-updated', handleCommandsUpdated);
   }, []);
 
   // 点击外部关闭选择器
@@ -638,8 +673,11 @@ export default function ChatPage({
       if (toolsSelectorRef.current && !toolsSelectorRef.current.contains(event.target as Node)) {
         setShowToolsSelector(false);
       }
+      if (commandSuggestionsRef.current && !commandSuggestionsRef.current.contains(event.target as Node)) {
+        setShowCommandSuggestions(false);
+      }
     };
-    
+
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
@@ -703,10 +741,54 @@ export default function ChatPage({
       return;
     }
 
-    const userContent = inputValue.trim();
-    const currentAttachments = [...attachments]; // 保存当前附件
+    // 检查是否使用了快捷指令（支持参数）
+    // 例如: /zh 6789 -> 快捷指令内容 + "6789"
+    let userContent = inputValue.trim();
+    let displayContent = userContent; // 用户看到的内容
+    let isUsingQuickCommand = false;
+
+    // 解析输入：检查是否以 / 开头
+    if (userContent.startsWith('/')) {
+      // 分割命令和参数
+      const spaceIndex = userContent.indexOf(' ');
+      const commandPart = spaceIndex > 0 ? userContent.substring(0, spaceIndex) : userContent;
+      const paramsPart = spaceIndex > 0 ? userContent.substring(spaceIndex + 1) : '';
+
+      const commandName = commandPart.substring(1); // 移除 /
+
+      // 查找匹配的快捷指令
+      const matchedCommand = quickCommands.find(cmd => cmd.name === commandName);
+
+      console.log('🔍 [Debug] Quick command parsing:');
+      console.log('   Input:', userContent);
+      console.log('   Command part:', commandPart);
+      console.log('   Command name:', commandName);
+      console.log('   Parameters:', paramsPart || '(none)');
+      console.log('   Matched command:', matchedCommand ? matchedCommand.name : 'NOT FOUND');
+
+      if (matchedCommand) {
+        isUsingQuickCommand = true;
+        // 组合快捷指令内容和参数
+        userContent = paramsPart
+          ? `${matchedCommand.content} ${paramsPart}`
+          : matchedCommand.content;
+        // displayContent 保持原样 (如 /zh 6789)
+
+        console.log('🚀 [Quick Command] Activated with parameters');
+        console.log('📝 [Quick Command] Name:', matchedCommand.name);
+        console.log('👁️ [Quick Command] Display:', displayContent);
+        console.log('📄 [Quick Command] Full content sent to API:', userContent);
+        console.log('🔒 [Quick Command] Incognito Mode: ENABLED');
+
+        setIncognitoMode(true); // 快捷指令自动进入隐身模式
+      } else {
+        console.log('❌ [Quick Command] No matching command found');
+      }
+    }
+
+    const currentAttachments = [...attachments];
     setInputValue('');
-    setAttachments([]); // 清空附件
+    setAttachments([]);
     setError(null);
 
     // 如果没有当前会话，创建一个新会话（强制清空旧消息，避免串话）
@@ -725,9 +807,10 @@ export default function ChatPage({
     const currentProviderName = selectedModel.providerName;
 
     // 添加用户消息（包含附件）
+    // 显示用户看到的内容（可能是 /tq），但实际发送的是完整内容
     const userMessage = addMessageToSession(activeSessionId, {
       role: 'user',
-      content: userContent,
+      content: displayContent, // 显示简短的命令名
       attachments: currentAttachments.length > 0 ? currentAttachments : undefined,
     });
 
@@ -770,9 +853,6 @@ export default function ChatPage({
     if (!incognitoMode && memorySettings.enabled && memorySettings.autoRetrieve) {
       try {
         ragContext = await buildContextWithMemories(userContent);
-        if (ragContext.retrievedMemories.length > 0) {
-          console.log(`RAG: Retrieved ${ragContext.retrievedMemories.length} memories`);
-        }
       } catch (e) {
         console.error('RAG context build failed:', e);
       }
@@ -782,20 +862,31 @@ export default function ChatPage({
     const personaPrompt = getPersonaPrompt();
     const ragPrompt = ragContext?.systemPrompt || '';
     const combinedSystemPrompt = [personaPrompt, ragPrompt].filter(Boolean).join('\n\n');
-    
-    console.log('Added messages, tempMessageId:', tempMessageId);
-    
-    // 发起 SSE 请求 - 使用用户消息构建请求
-    const allMessages = [...messages, userMessage];
-    
-    console.log('Sending request with messages:', allMessages.length);
-    
+
+    // 发起 SSE 请求 - 构建用于API的消息列表
+    // 注意：这里需要使用完整的userContent（快捷指令的完整内容），而不是displayContent
+    const userMessageForAPI = {
+      ...userMessage,
+      content: userContent, // 使用完整内容发送给API
+    };
+    const allMessages = [...messages, userMessageForAPI];
+
+    // 调试日志：显示发送给API的最后一条消息
+    console.log('📤 [API] Sending message to API:');
+    console.log('   Role:', userMessageForAPI.role);
+    console.log('   Content:', userMessageForAPI.content);
+    console.log('   Is Quick Command:', isUsingQuickCommand);
+    console.log('   Incognito Mode:', isUsingQuickCommand ? 'YES' : incognitoMode ? 'YES' : 'NO');
+
+    // 创建 AbortController 用于取消请求
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+
     try {
       await streamChatCompletion(
         allMessages,
         {
           onStart: () => {
-            console.log('Stream started');
             setActiveToolCalls([]);
             setShowToolCallProgress(false);
             // 记录思考开始时间，重置追踪数据
@@ -803,10 +894,19 @@ export default function ChatPage({
             firstTokenTimeRef.current = 0;
             completedToolCallsRef.current = [];
             usageInfoRef.current = null;
+            reasoningContentRef.current = ''; // 重置推理内容
           },
           onFirstToken: () => {
             // 记录首个 token 的时间
             firstTokenTimeRef.current = Date.now() - thinkingStartTimeRef.current;
+          },
+          onReasoning: (content) => {
+            // 累积推理内容
+            reasoningContentRef.current += content;
+            // 记录到 Inspector 活动日志
+            if (activeSessionId) {
+              addActivityLog(activeSessionId, 'thought', content);
+            }
           },
           onToken: (token) => {
             // 流式更新消息内容 - 必须创建新对象让 React 检测到变化
@@ -825,10 +925,10 @@ export default function ChatPage({
           onUsage: (usage) => {
             // 保存用量信息
             const thinkingTime = Date.now() - thinkingStartTimeRef.current;
-            const tokensPerSecond = thinkingTime > 0 
-              ? (usage.completion_tokens / (thinkingTime / 1000)) 
+            const tokensPerSecond = thinkingTime > 0
+              ? (usage.completion_tokens / (thinkingTime / 1000))
               : 0;
-            
+
             usageInfoRef.current = {
               promptTokens: usage.prompt_tokens,
               completionTokens: usage.completion_tokens,
@@ -839,7 +939,6 @@ export default function ChatPage({
           },
           // 工具调用开始
           onToolCallStart: (toolCalls) => {
-            console.log('Tool calls started:', toolCalls);
             setShowToolCallProgress(true);
             const now = Date.now();
             setActiveToolCalls(toolCalls.map(tc => ({
@@ -851,14 +950,13 @@ export default function ChatPage({
           },
           // 工具调用进度
           onToolCallProgress: (toolCallId, status, result) => {
-            console.log('Tool call progress:', toolCallId, status, result);
             const now = Date.now();
             setActiveToolCalls((prev) => {
               const updated = prev.map(tc => {
                 if (tc.toolCall.id === toolCallId) {
                   const startTime = tc.startTime || now;
                   const endTime = (status === 'completed' || status === 'error') ? now : tc.endTime;
-                  
+
                   // 当工具调用完成时，收集到记录中
                   if ((status === 'completed' || status === 'error') && result) {
                     const record: ToolCallRecord = {
@@ -875,10 +973,10 @@ export default function ChatPage({
                       completedToolCallsRef.current.push(record);
                     }
                   }
-                  
-                  return { 
-                    ...tc, 
-                    status, 
+
+                  return {
+                    ...tc,
+                    status,
                     result,
                     startTime,
                     endTime,
@@ -890,44 +988,43 @@ export default function ChatPage({
             });
           },
           // 工具调用完成
-          onToolCallComplete: (results) => {
-            console.log('Tool calls complete:', results);
+          onToolCallComplete: (_results) => {
             // 不自动隐藏，让用户可以查看结果
           },
           onComplete: (fullContent) => {
             try {
-              console.log('Stream complete, content length:', fullContent.length);
-              
               // 针对图片模型的特殊处理：如果返回的是纯 base64 数据，包装成 data URL 供 Markdown 渲染
               let processedContent = fullContent || '';
-              const isImageModel = currentModel?.toLowerCase().includes('image') 
-                || currentModel?.toLowerCase().includes('vision') 
+              const isImageModel = currentModel?.toLowerCase().includes('image')
+                || currentModel?.toLowerCase().includes('vision')
                 || currentModel?.toLowerCase().includes('preview');
               const hasMarkdownImage = /!\[.*?\]\(.+?\)/.test(fullContent);
-              
+
               if (isImageModel && !hasMarkdownImage) {
                 const cleaned = fullContent.replace(/[\r\n]/g, '').trim();
                 // 简单判断是否可能是 base64 数据
                 const looksLikeBase64 = cleaned.length > 1000 && /^[A-Za-z0-9+/=]+$/.test(cleaned);
                 if (looksLikeBase64) {
                   processedContent = `![image](data:image/png;base64,${cleaned})`;
-                  console.log('Image content detected, wrapped as data URL for rendering.');
                 }
               }
 
               // 输出熔断：防止系统提示词泄漏
               processedContent = applyOutputSentinel(processedContent, personaPrompt);
-              
+
               // 计算思考时间
               const thinkingTime = Date.now() - thinkingStartTimeRef.current;
-              const toolCalls = completedToolCallsRef.current.length > 0 
-                ? [...completedToolCallsRef.current] 
+              const toolCalls = completedToolCallsRef.current.length > 0
+                ? [...completedToolCallsRef.current]
                 : undefined;
-              
+
               // 获取用量信息
               const usage = usageInfoRef.current || undefined;
-              
-              // 保存完整的助手消息到存储（包含模型信息、工具调用、思考时间、用量）
+
+              // 获取推理内容
+              const reasoningContent = reasoningContentRef.current || undefined;
+
+              // 保存完整的助手消息到存储（包含模型信息、工具调用、思考时间、推理内容、用量）
               let savedMessage;
               try {
                 savedMessage = addMessageToSession(activeSessionId!, {
@@ -937,6 +1034,7 @@ export default function ChatPage({
                   providerName: currentProviderName,
                   toolCalls,
                   thinkingTime,
+                  reasoningContent,
                   usage,
                 });
               } catch (e) {
@@ -951,24 +1049,21 @@ export default function ChatPage({
                   providerName: currentProviderName,
                   toolCalls,
                   thinkingTime,
+                  reasoningContent,
                   usage,
                 };
               }
-              
+
               // 用保存的消息替换临时消息
               setMessages((prev) => {
                 try {
-                  console.log('onComplete - prev messages:', prev.length, 'looking for:', tempMessageId);
-                  
                   const found = prev.some(msg => msg.id === tempMessageId);
-                  console.log('Found temp message:', found);
-                  
+
                   if (!found) {
                     // 如果没找到临时消息，直接添加保存的消息
-                    console.log('Temp message not found, adding saved message directly');
                     return [...prev, savedMessage];
                   }
-                  
+
                   return prev.map((msg) => {
                     if (msg.id === tempMessageId) {
                       return savedMessage;
@@ -981,7 +1076,7 @@ export default function ChatPage({
                   return [...prev, savedMessage];
                 }
               });
-              
+
               setIsLoading(false);
               setActiveToolCalls([]);
               // 清除引用
@@ -989,17 +1084,14 @@ export default function ChatPage({
               thinkingStartTimeRef.current = 0;
               firstTokenTimeRef.current = 0;
               usageInfoRef.current = null;
+              reasoningContentRef.current = '';
 
               // RAG: 自动提取记忆（非隐身模式）
               if (!incognitoMode) {
                 try {
                   const memorySettings = getMemorySettings();
                   if (memorySettings.enabled && memorySettings.autoSummarize) {
-                    extractAndSaveMemories([userMessage, savedMessage]).then((extractedMemories) => {
-                      if (extractedMemories.length > 0) {
-                        console.log(`RAG: Extracted ${extractedMemories.length} memories`);
-                      }
-                    }).catch((e) => {
+                    extractAndSaveMemories([userMessage, savedMessage]).catch((e) => {
                       console.error('Memory extraction failed:', e);
                     });
                   }
@@ -1013,10 +1105,7 @@ export default function ChatPage({
                 try {
                   const memorySettings = getMemorySettings();
                   if (memorySettings.enabled && memorySettings.forgettingEnabled && memorySettings.cleanupFrequency === 'after_chat') {
-                    const cleanupResult = performSmartCleanup();
-                    if (cleanupResult.deletedCount > 0) {
-                      console.log('Memory cleanup:', cleanupResult.reason);
-                    }
+                    performSmartCleanup();
                   }
                 } catch (e) {
                   console.error('Memory cleanup failed:', e);
@@ -1058,6 +1147,10 @@ export default function ChatPage({
           incognitoMode,
           // 固定 persona + RAG 系统提示
           systemPrompt: combinedSystemPrompt,
+          // 取消信号
+          abortSignal: abortController.signal,
+          // 会话 ID（用于 Inspector 活动日志）
+          sessionId: activeSessionId,
         }
       );
     } catch (error) {
@@ -1071,10 +1164,73 @@ export default function ChatPage({
       setShowToolCallProgress(false);
     } finally {
       sendLockRef.current = false;
+      abortControllerRef.current = null;
     }
   };
 
+  // 停止生成
+  const handleStopGeneration = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+      setIsLoading(false);
+      setActiveToolCalls([]);
+      setShowToolCallProgress(false);
+    }
+  };
+
+  // 选择快捷指令
+  const handleSelectCommand = useCallback((command: QuickCommand) => {
+    // 插入命令名，用户可以继续输入参数（如 /zh 然后输入 6789）
+    setInputValue(`/${command.name} `);
+    setShowCommandSuggestions(false);
+    setCommandFilter('');
+    // 聚焦到输入框末尾，让用户可以继续输入参数
+    setTimeout(() => {
+      textareaRef.current?.focus();
+      const len = command.name.length + 2; // +2 for '/' and space
+      textareaRef.current?.setSelectionRange(len, len);
+    }, 0);
+  }, []);
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    // 如果命令建议面板打开，处理键盘导航
+    if (showCommandSuggestions) {
+      const filteredCommands = quickCommands.filter(cmd =>
+        cmd.name.toLowerCase().includes(commandFilter) ||
+        (cmd.description?.toLowerCase() || '').includes(commandFilter)
+      );
+
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setSelectedCommandIndex(prev =>
+          Math.min(prev + 1, filteredCommands.length - 1)
+        );
+        return;
+      }
+
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setSelectedCommandIndex(prev => Math.max(prev - 1, 0));
+        return;
+      }
+
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        if (filteredCommands[selectedCommandIndex]) {
+          handleSelectCommand(filteredCommands[selectedCommandIndex]);
+        }
+        return;
+      }
+
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setShowCommandSuggestions(false);
+        return;
+      }
+    }
+
+    // 原有的发送逻辑
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -1088,7 +1244,9 @@ export default function ChatPage({
       return;
     }
     try {
-      const files = await window.electronAPI.selectFiles();
+      // 传入当前模型的能力，用于动态过滤支持的文件格式
+      const capabilities = selectedModel?.capabilities;
+      const files = await window.electronAPI.selectFiles(capabilities);
       if (files.length > 0) {
         setAttachments((prev) => [...prev, ...files]);
       }
@@ -1135,6 +1293,19 @@ export default function ChatPage({
         newSet.delete(categoryId);
       } else {
         newSet.add(categoryId);
+      }
+      return newSet;
+    });
+  }, []);
+
+  // 切换推理内容展开状态
+  const toggleReasoning = useCallback((messageId: string) => {
+    setExpandedReasoning((prev) => {
+      const newSet = new Set(prev);
+      if (newSet.has(messageId)) {
+        newSet.delete(messageId);
+      } else {
+        newSet.add(messageId);
       }
       return newSet;
     });
@@ -1253,7 +1424,7 @@ export default function ChatPage({
       <div className="flex-1 overflow-y-auto p-4">
         {messages.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center text-gray-400 dark:text-gray-500">
-            <img src="/icon.png" alt="Tage" className="w-16 h-16 mb-4 rounded-full" />
+            <img src={tageIcon} alt="Tage" className="w-16 h-16 mb-4 rounded-full" />
             <p className="text-lg">开始新对话</p>
             <p className="text-sm mt-2">输入消息与 Tage 交流</p>
             {availableModels.length === 0 && (
@@ -1267,17 +1438,15 @@ export default function ChatPage({
             {messages.map((message, index) => (
               <div
                 key={message.id}
-                className={`group flex ${
-                  message.role === 'user' ? 'justify-end' : 'justify-start'
-                }`}
+                className={`group flex ${message.role === 'user' ? 'justify-end' : 'justify-start'
+                  }`}
               >
                 <div className={`max-w-[85%] ${message.role === 'assistant' ? 'w-full' : ''}`}>
                   <div
-                    className={`rounded-2xl ${
-                      message.role === 'user'
-                        ? 'bg-teal-600 text-white px-4 py-3'
-                        : 'bg-gray-50 dark:bg-zinc-800/50 text-gray-900 dark:text-gray-100 px-5 py-4'
-                    }`}
+                    className={`rounded-2xl ${message.role === 'user'
+                      ? 'bg-teal-600 text-white px-4 py-3'
+                      : 'bg-gray-50 dark:bg-zinc-800/50 text-gray-900 dark:text-gray-100 px-5 py-4'
+                      }`}
                   >
                     {message.role === 'user' ? (
                       <div>
@@ -1291,47 +1460,71 @@ export default function ChatPage({
                       </div>
                     ) : (
                       <div className="break-words">
-                        {/* 思考时间和工具摘要 - 显示在顶部 */}
-                        {(message.thinkingTime || message.toolCalls) && (
-                          <div className="flex items-center gap-3 mb-3 text-xs text-gray-500 dark:text-gray-400">
-                            {message.thinkingTime && (
-                              <div className="flex items-center gap-1.5">
-                                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                  <circle cx="12" cy="12" r="10" strokeWidth="2" />
-                                  <path strokeLinecap="round" strokeWidth="2" d="M12 6v6l4 2" />
-                                </svg>
-                                <span>思考了 {(message.thinkingTime / 1000).toFixed(3)} 秒</span>
-                                <ChevronDown className="w-3 h-3" />
-                              </div>
-                            )}
-                            {message.toolCalls && message.toolCalls.length > 0 && (
-                              <div className="relative group/tools">
-                                <div className="flex items-center gap-1.5 text-teal-600 dark:text-teal-400 cursor-pointer hover:underline">
-                                  <Wrench className="w-3.5 h-3.5" />
-                                  <span>{message.toolCalls.length} 个工具</span>
+                        {/* 思考时间、推理内容和工具摘要 - 显示在顶部 */}
+                        {(message.thinkingTime || message.toolCalls || message.reasoningContent) && (
+                          <div className="mb-3">
+                            <div className="flex items-center gap-3 text-xs text-gray-500 dark:text-gray-400">
+                              {/* 思考时间 - 可点击展开推理内容 */}
+                              {(message.thinkingTime || message.reasoningContent) && (
+                                <button
+                                  onClick={() => message.reasoningContent && toggleReasoning(message.id)}
+                                  className={`flex items-center gap-1.5 ${message.reasoningContent ? 'cursor-pointer hover:text-purple-500 dark:hover:text-purple-400' : ''}`}
+                                  disabled={!message.reasoningContent}
+                                >
+                                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <circle cx="12" cy="12" r="10" strokeWidth="2" />
+                                    <path strokeLinecap="round" strokeWidth="2" d="M12 6v6l4 2" />
+                                  </svg>
+                                  {message.thinkingTime && (
+                                    <span>思考了 {(message.thinkingTime / 1000).toFixed(3)} 秒</span>
+                                  )}
+                                  {message.reasoningContent && (
+                                    <ChevronDown className={`w-3 h-3 transition-transform ${expandedReasoning.has(message.id) ? 'rotate-180' : ''}`} />
+                                  )}
+                                </button>
+                              )}
+                              {message.toolCalls && message.toolCalls.length > 0 && (
+                                <div className="relative group/tools">
+                                  <div className="flex items-center gap-1.5 text-teal-600 dark:text-teal-400 cursor-pointer hover:underline">
+                                    <Wrench className="w-3.5 h-3.5" />
+                                    <span>{message.toolCalls.length} 个工具</span>
+                                  </div>
+                                  {/* 悬停提示 */}
+                                  <div className="absolute left-0 top-full mt-1 z-50 hidden group-hover/tools:block bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 rounded-lg shadow-lg p-3 min-w-[180px]">
+                                    <div className="text-xs font-medium text-gray-600 dark:text-gray-300 mb-2">自动选择的工具：</div>
+                                    <ul className="space-y-1">
+                                      {message.toolCalls.map((tc) => (
+                                        <li key={tc.id} className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
+                                          <span className="w-1 h-1 bg-gray-400 rounded-full" />
+                                          {getToolDisplayName(tc.name)}
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  </div>
                                 </div>
-                                {/* 悬停提示 */}
-                                <div className="absolute left-0 top-full mt-1 z-50 hidden group-hover/tools:block bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 rounded-lg shadow-lg p-3 min-w-[180px]">
-                                  <div className="text-xs font-medium text-gray-600 dark:text-gray-300 mb-2">自动选择的工具：</div>
-                                  <ul className="space-y-1">
-                                    {message.toolCalls.map((tc) => (
-                                      <li key={tc.id} className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
-                                        <span className="w-1 h-1 bg-gray-400 rounded-full" />
-                                        {getToolDisplayName(tc.name)}
-                                      </li>
-                                    ))}
-                                  </ul>
+                              )}
+                            </div>
+
+                            {/* 推理内容展开区域 */}
+                            {message.reasoningContent && expandedReasoning.has(message.id) && (
+                              <div className="mt-2 p-3 bg-purple-50 dark:bg-purple-950/30 border border-purple-200 dark:border-purple-800/50 rounded-lg">
+                                <div className="flex items-center gap-2 mb-2 text-xs font-medium text-purple-600 dark:text-purple-400">
+                                  <Lightbulb className="w-3.5 h-3.5" />
+                                  <span>思维链 / Chain of Thought</span>
+                                </div>
+                                <div className="text-xs text-gray-700 dark:text-gray-300 whitespace-pre-wrap max-h-64 overflow-y-auto">
+                                  {message.reasoningContent}
                                 </div>
                               </div>
                             )}
                           </div>
                         )}
-                        
+
                         {/* 工具调用卡片 */}
                         {message.toolCalls && message.toolCalls.length > 0 && (
                           <ToolCallCards toolCalls={message.toolCalls} messageId={message.id} />
                         )}
-                        
+
                         {/* 显示模型名称 */}
                         {message.model && (
                           <div className="flex items-center gap-2 mb-3 pb-2 border-b border-gray-200 dark:border-zinc-700">
@@ -1439,25 +1632,83 @@ export default function ChatPage({
       <div className="p-4 border-t border-gray-100 dark:border-zinc-800">
         <div className="flex items-end gap-2 max-w-4xl mx-auto">
           <div className="flex-1 relative">
+            {/* 快捷指令建议面板 */}
+            {showCommandSuggestions && (() => {
+              const filteredCommands = quickCommands.filter(cmd =>
+                cmd.name.toLowerCase().includes(commandFilter) ||
+                (cmd.description?.toLowerCase() || '').includes(commandFilter)
+              );
+
+              if (filteredCommands.length === 0) return null;
+
+              return (
+                <div
+                  ref={commandSuggestionsRef}
+                  className="absolute bottom-full left-0 right-0 mb-2 bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-700 rounded-lg shadow-lg overflow-hidden z-50 max-h-60 overflow-y-auto"
+                >
+                  <div className="px-3 py-2 text-xs font-medium text-gray-500 dark:text-gray-400 border-b border-gray-200 dark:border-zinc-700">
+                    快捷提示
+                  </div>
+                  {filteredCommands.map((cmd, index) => (
+                    <button
+                      key={cmd.id}
+                      onClick={() => handleSelectCommand(cmd)}
+                      className={`w-full text-left px-4 py-3 transition-colors border-b border-gray-100 dark:border-zinc-800 last:border-b-0 ${index === selectedCommandIndex
+                        ? 'bg-blue-50 dark:bg-blue-950/30'
+                        : 'hover:bg-gray-50 dark:hover:bg-zinc-800'
+                        }`}
+                    >
+                      <div className="flex items-center gap-2 mb-1">
+                        <code className="text-sm font-mono px-2 py-0.5 bg-gray-100 dark:bg-zinc-800 text-blue-600 dark:text-blue-400 rounded">
+                          /{cmd.name}
+                        </code>
+                        {cmd.description && (
+                          <span className="text-xs text-gray-500 dark:text-gray-400">
+                            {cmd.description}
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-xs text-gray-600 dark:text-gray-300 line-clamp-2">
+                        {cmd.content}
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              );
+            })()}
+
             {/* 附件预览 */}
             {attachments.length > 0 && (
               <AttachmentPreview
                 attachments={attachments}
                 onRemove={handleRemoveAttachment}
                 compact
+                capabilities={selectedModel?.capabilities}
               />
             )}
             <textarea
               ref={textareaRef}
               value={inputValue}
-              onChange={(e) => setInputValue(e.target.value)}
+              onChange={(e) => {
+                const value = e.target.value;
+                setInputValue(value);
+
+                // 检测斜杠命令 - 只用于显示建议面板
+                if (value.startsWith('/') && !value.includes(' ')) {
+                  const filter = value.slice(1).toLowerCase();
+                  setCommandFilter(filter);
+                  setShowCommandSuggestions(true);
+                  setSelectedCommandIndex(0);
+                } else {
+                  setShowCommandSuggestions(false);
+                }
+              }}
               onKeyDown={handleKeyDown}
               placeholder="输入消息... (Shift+Enter 换行)"
               rows={1}
               disabled={isLoading}
-              className={`w-full px-4 py-3 pr-12 border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed ${
-                attachments.length > 0 ? 'rounded-b-lg' : 'rounded-lg'
-              }`}
+              className={`w-full px-4 py-3 pr-12 border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed ${attachments.length > 0 ? 'rounded-b-lg' : 'rounded-lg'
+                }`}
               style={{ minHeight: '48px', maxHeight: '200px' }}
             />
           </div>
@@ -1470,11 +1721,10 @@ export default function ChatPage({
             <button
               onClick={handleSelectAttachments}
               disabled={isLoading}
-              className={`p-2 rounded-lg transition-colors ${
-                attachments.length > 0
-                  ? 'text-teal-500 hover:text-teal-600 bg-teal-50 dark:bg-teal-950/30'
-                  : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-zinc-800'
-              } disabled:opacity-50 disabled:cursor-not-allowed`}
+              className={`p-2 rounded-lg transition-colors ${attachments.length > 0
+                ? 'text-teal-500 hover:text-teal-600 bg-teal-50 dark:bg-teal-950/30'
+                : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-zinc-800'
+                } disabled:opacity-50 disabled:cursor-not-allowed`}
               title="添加附件"
             >
               <Paperclip className="w-5 h-5" />
@@ -1485,16 +1735,15 @@ export default function ChatPage({
               <div className="relative" ref={reasoningSelectorRef}>
                 <button
                   onClick={() => setShowReasoningSelector(!showReasoningSelector)}
-                  className={`p-2 rounded-lg transition-colors ${
-                    reasoningLevel !== 'off'
-                      ? 'text-purple-500 hover:text-purple-600 bg-purple-50 dark:bg-purple-950/30'
-                      : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-zinc-800'
-                  }`}
+                  className={`p-2 rounded-lg transition-colors ${reasoningLevel !== 'off'
+                    ? 'text-purple-500 hover:text-purple-600 bg-purple-50 dark:bg-purple-950/30'
+                    : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-zinc-800'
+                    }`}
                   title="推理强度"
                 >
                   <Lightbulb className="w-5 h-5" />
                 </button>
-                
+
                 {/* 推理强度下拉菜单 */}
                 {showReasoningSelector && (
                   <div className="absolute bottom-full mb-2 left-0 w-64 bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-700 rounded-lg shadow-lg overflow-hidden z-50">
@@ -1512,17 +1761,15 @@ export default function ChatPage({
                             setReasoningLevel(level.value);
                             setShowReasoningSelector(false);
                           }}
-                          className={`w-full flex items-start gap-3 p-2 rounded-lg text-left transition-colors ${
-                            reasoningLevel === level.value
-                              ? 'bg-purple-50 dark:bg-purple-950/30'
-                              : 'hover:bg-gray-50 dark:hover:bg-zinc-800'
-                          }`}
+                          className={`w-full flex items-start gap-3 p-2 rounded-lg text-left transition-colors ${reasoningLevel === level.value
+                            ? 'bg-purple-50 dark:bg-purple-950/30'
+                            : 'hover:bg-gray-50 dark:hover:bg-zinc-800'
+                            }`}
                         >
-                          <div className={`mt-0.5 w-4 h-4 rounded-full border-2 flex items-center justify-center ${
-                            reasoningLevel === level.value
-                              ? 'border-purple-500 bg-purple-500'
-                              : 'border-gray-300 dark:border-zinc-600'
-                          }`}>
+                          <div className={`mt-0.5 w-4 h-4 rounded-full border-2 flex items-center justify-center ${reasoningLevel === level.value
+                            ? 'border-purple-500 bg-purple-500'
+                            : 'border-gray-300 dark:border-zinc-600'
+                            }`}>
                             {reasoningLevel === level.value && (
                               <div className="w-1.5 h-1.5 rounded-full bg-white" />
                             )}
@@ -1549,16 +1796,15 @@ export default function ChatPage({
               <div className="relative" ref={toolsSelectorRef}>
                 <button
                   onClick={() => setShowToolsSelector(!showToolsSelector)}
-                  className={`p-2 rounded-lg transition-colors ${
-                    toolSelectionMode !== 'none'
-                      ? 'text-blue-500 hover:text-blue-600 bg-blue-50 dark:bg-blue-950/30'
-                      : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-zinc-800'
-                  }`}
+                  className={`p-2 rounded-lg transition-colors ${toolSelectionMode !== 'none'
+                    ? 'text-blue-500 hover:text-blue-600 bg-blue-50 dark:bg-blue-950/30'
+                    : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-zinc-800'
+                    }`}
                   title="工具选择"
                 >
                   <Wand2 className="w-5 h-5" />
                 </button>
-                
+
                 {/* 工具选择下拉菜单 */}
                 {showToolsSelector && (
                   <div className="absolute bottom-full mb-2 left-0 w-72 bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-700 rounded-lg shadow-lg overflow-hidden z-50">
@@ -1568,7 +1814,7 @@ export default function ChatPage({
                         允许 AI 在下一次回复时使用所选工具。
                       </p>
                     </div>
-                    
+
                     {/* 模式选择 */}
                     <div className="p-2 border-b border-gray-100 dark:border-zinc-800">
                       <div className="flex gap-1">
@@ -1576,11 +1822,10 @@ export default function ChatPage({
                           <button
                             key={mode}
                             onClick={() => handleToolModeChange(mode)}
-                            className={`flex-1 px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
-                              toolSelectionMode === mode || (toolSelectionMode === 'custom' && mode === 'auto')
-                                ? 'bg-teal-600 text-white'
-                                : 'bg-gray-100 dark:bg-zinc-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-zinc-700'
-                            }`}
+                            className={`flex-1 px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${toolSelectionMode === mode || (toolSelectionMode === 'custom' && mode === 'auto')
+                              ? 'bg-teal-600 text-white'
+                              : 'bg-gray-100 dark:bg-zinc-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-zinc-700'
+                              }`}
                           >
                             {mode === 'auto' ? '✨ 自动' : mode === 'all' ? '全选' : '全不选'}
                           </button>
@@ -1590,7 +1835,7 @@ export default function ChatPage({
                         让 AI 根据你的消息自动选择最相关的工具。
                       </p>
                     </div>
-                    
+
                     {/* 工具分类列表 - 使用 memoized 数据 */}
                     <div className="max-h-64 overflow-y-auto">
                       {toolsByCategory.map(({ category, tools: categoryTools, selectedCount }) => {
@@ -1648,11 +1893,10 @@ export default function ChatPage({
             {memoryEnabled && (
               <button
                 onClick={() => setIncognitoMode(!incognitoMode)}
-                className={`p-2 rounded-lg transition-colors ${
-                  incognitoMode
-                    ? 'text-amber-500 hover:text-amber-600 bg-amber-50 dark:bg-amber-950/30'
-                    : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-zinc-800'
-                }`}
+                className={`p-2 rounded-lg transition-colors ${incognitoMode
+                  ? 'text-amber-500 hover:text-amber-600 bg-amber-50 dark:bg-amber-950/30'
+                  : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-zinc-800'
+                  }`}
                 title={incognitoMode ? '隐身模式已开启 - 点击关闭' : '隐身模式已关闭 - 点击禁用记忆功能'}
               >
                 {incognitoMode ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
@@ -1670,7 +1914,7 @@ export default function ChatPage({
               <span>{selectedModel?.model || '选择模型'}</span>
               <ChevronDown className={`w-4 h-4 transition-transform ${showModelSelector ? 'rotate-180' : ''}`} />
             </button>
-            
+
             {/* 模型下拉菜单 */}
             {showModelSelector && (
               <div className="absolute bottom-full mb-2 right-0 w-64 bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-700 rounded-lg shadow-lg overflow-hidden z-50">
@@ -1692,11 +1936,10 @@ export default function ChatPage({
                           <button
                             key={`${model.providerId}-${model.model}`}
                             onClick={() => handleSelectModel(model)}
-                            className={`w-full px-3 py-2 text-sm text-left flex items-center justify-between hover:bg-gray-100 dark:hover:bg-zinc-800 ${
-                              selectedModel?.providerId === model.providerId && selectedModel?.model === model.model
-                                ? 'bg-blue-50 dark:bg-blue-950 text-blue-600 dark:text-blue-400'
-                                : 'text-gray-700 dark:text-gray-300'
-                            }`}
+                            className={`w-full px-3 py-2 text-sm text-left flex items-center justify-between hover:bg-gray-100 dark:hover:bg-zinc-800 ${selectedModel?.providerId === model.providerId && selectedModel?.model === model.model
+                              ? 'bg-blue-50 dark:bg-blue-950 text-blue-600 dark:text-blue-400'
+                              : 'text-gray-700 dark:text-gray-300'
+                              }`}
                           >
                             <span>{model.model}</span>
                             {selectedModel?.providerId === model.providerId && selectedModel?.model === model.model && (
@@ -1712,18 +1955,24 @@ export default function ChatPage({
             )}
           </div>
 
-          {/* 发送按钮 */}
-          <button
-            onClick={handleSend}
-            disabled={!inputValue.trim() || isLoading}
-            className="p-2 text-gray-400 hover:text-blue-500 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg hover:bg-gray-100 dark:hover:bg-zinc-800 transition-colors"
-          >
-            {isLoading ? (
-              <Loader2 className="w-5 h-5 animate-spin" />
-            ) : (
+          {/* 发送/停止按钮 */}
+          {isLoading ? (
+            <button
+              onClick={handleStopGeneration}
+              className="p-2 bg-red-500 hover:bg-red-600 text-white rounded-lg transition-colors"
+              title="停止生成"
+            >
+              <Square className="w-4 h-4 fill-current" />
+            </button>
+          ) : (
+            <button
+              onClick={handleSend}
+              disabled={!inputValue.trim()}
+              className="p-2 text-gray-400 hover:text-blue-500 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg hover:bg-gray-100 dark:hover:bg-zinc-800 transition-colors"
+            >
               <Send className="w-5 h-5" />
-            )}
-          </button>
+            </button>
+          )}
         </div>
       </div>
     </div>

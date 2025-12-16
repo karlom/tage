@@ -96,7 +96,7 @@ async function migrateFromLocalStorage(): Promise<void> {
 }
 
 // 同步读取（从内存缓存）
-function storageGet<T>(key: string, defaultValue: T): T {
+export function storageGet<T>(key: string, defaultValue: T): T {
   if (!isCacheInitialized) {
     // 如果缓存未初始化，先尝试从 localStorage 读取
     try {
@@ -157,7 +157,7 @@ async function flushWrites(): Promise<void> {
 }
 
 // 同步写入（更新内存缓存，延迟批量持久化）
-function storageSet(key: string, value: unknown): void {
+export function storageSet(key: string, value: unknown): void {
   // 更新内存缓存
   memoryCache[key] = value;
 
@@ -195,7 +195,10 @@ export function storageDelete(key: string): void {
 export interface ModelCapabilities {
   reasoning?: boolean;        // 推理/扩展思考
   functionCalling?: boolean;  // 工具调用
-  vision?: boolean;           // 视觉识别
+  vision?: boolean;           // 视觉识别（图片）
+  audio?: boolean;            // 音频理解
+  video?: boolean;            // 视频理解
+  documents?: boolean;        // 文档理解（PDF、Word等）
 }
 
 // 推理强度级别
@@ -241,7 +244,7 @@ export interface UsageInfo {
 
 export interface Message {
   id: string;
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'system';
   content: string;
   timestamp: number;
   model?: string;        // AI 回复使用的模型
@@ -249,6 +252,7 @@ export interface Message {
   // 新增：工具调用相关
   toolCalls?: ToolCallRecord[];  // 工具调用记录
   thinkingTime?: number;         // 思考时间（毫秒）
+  reasoningContent?: string;     // 推理/思维链内容
   // 新增：用量信息
   usage?: UsageInfo;
   // 新增：文件附件
@@ -278,6 +282,16 @@ export interface Memory {
   pinned: boolean;          // 用户标记为重要（不会被遗忘）
 }
 
+// 快捷指令接口
+export interface QuickCommand {
+  id: string;              // 唯一标识
+  name: string;            // 命令名称（用于触发），如 "commit", "review"
+  content: string;         // 展开后的内容
+  description?: string;    // 命令描述（可选）
+  createdAt: number;       // 创建时间
+  updatedAt: number;       // 更新时间
+}
+
 // 衰减速率类型
 export type DecayRate = 'fast' | 'normal' | 'slow';
 
@@ -288,20 +302,20 @@ export type CleanupFrequency = 'after_chat' | 'daily' | 'manual';
 export interface MemorySettings {
   // 记忆功能
   enabled: boolean;
-  
+
   // 记忆检索
   autoRetrieve: boolean;
   queryRewriting: boolean;
   maxRetrieveCount: number;  // 1-20
   similarityThreshold: number;  // 0-100
-  
+
   // 记忆总结
   autoSummarize: boolean;
-  
+
   // 模型配置
   toolModel: string;  // 记忆工具模型，空字符串表示使用默认
   embeddingModel: string;  // 嵌入模型
-  
+
   // 智能遗忘设置
   forgettingEnabled: boolean;      // 是否启用智能遗忘
   maxMemoryCount: number;          // 最大记忆数量限制
@@ -331,7 +345,7 @@ const defaultMemorySettings: MemorySettings = {
 // ==================== 搜索 API 配置 ====================
 
 // 搜索 API 提供商类型
-export type SearchApiProvider = 'none' | 'serpapi' | 'brave' | 'google';
+export type SearchApiProvider = 'none' | 'serpapi' | 'brave' | 'google' | 'tavily';
 
 // 搜索 API 配置接口
 export interface SearchApiConfig {
@@ -358,6 +372,7 @@ export interface Tool {
   description: string;
   categoryId: string;
   enabled: boolean;
+  requiresApproval?: boolean; // 是否需要用户批准
 }
 
 // 工具分类接口
@@ -388,10 +403,12 @@ const defaultTools: Tool[] = [
   { id: 'mac_calendar_list_today', name: '查看今日日历', description: '读取今天的日历事件', categoryId: 'macos', enabled: true },
   { id: 'mac_reminder_add', name: '添加提醒事项', description: '在提醒事项中创建代办', categoryId: 'macos', enabled: true },
   { id: 'mac_reminder_list_today', name: '查看今日提醒', description: '读取今天到期的提醒', categoryId: 'macos', enabled: true },
+  { id: 'mac_reminder_lists', name: '获取提醒列表', description: '获取所有提醒事项列表的名称', categoryId: 'macos', enabled: true },
+  { id: 'mac_reminder_list_all', name: '查看所有提醒', description: '获取指定列表中所有未完成的提醒', categoryId: 'macos', enabled: true },
   { id: 'mac_set_volume', name: '设置音量', description: '调整系统输出音量 (0-100)', categoryId: 'macos', enabled: true },
   { id: 'mac_open_app', name: '打开应用', description: '打开指定的 macOS 应用', categoryId: 'macos', enabled: true },
-  { id: 'mac_run_shell', name: '运行 Shell', description: '执行本机 shell 命令', categoryId: 'macos', enabled: true },
-  { id: 'mac_run_applescript', name: '运行 AppleScript', description: '执行 AppleScript 脚本', categoryId: 'macos', enabled: true },
+  { id: 'mac_run_shell', name: '运行 Shell', description: '执行本机 shell 命令', categoryId: 'macos', enabled: true, requiresApproval: true },
+  { id: 'mac_run_applescript', name: '运行 AppleScript', description: '执行 AppleScript 脚本', categoryId: 'macos', enabled: true, requiresApproval: true },
 ];
 
 const STORAGE_KEYS = {
@@ -406,6 +423,7 @@ const STORAGE_KEYS = {
   CHAT_SETTINGS: 'tageai_chat_settings',
   GENERAL_SETTINGS: 'tageai_general_settings',
   UI_SETTINGS: 'tageai_ui_settings',
+  QUICK_COMMANDS: 'tageai_quick_commands',
 };
 
 // ==================== 设置接口 ====================
@@ -440,6 +458,7 @@ export interface GeneralSettings {
   language: 'zh' | 'en';          // 默认 'zh'
   launchAtLogin: boolean;         // 默认 false
   minimizeToTray: boolean;        // 默认 false
+  developerMode: boolean;         // 默认 false，开启后显示 Inspector 等开发工具
 }
 
 // 默认通用设置
@@ -448,6 +467,7 @@ const defaultGeneralSettings: GeneralSettings = {
   language: 'zh',
   launchAtLogin: false,
   minimizeToTray: false,
+  developerMode: false,
 };
 
 // UI 设置接口
@@ -548,25 +568,25 @@ function migrateModels(models: (string | ModelConfig)[]): ModelConfig[] {
 function getModelCapabilities(modelId: string): ModelCapabilities {
   const id = modelId.toLowerCase();
   const capabilities: ModelCapabilities = {};
-  
+
   // 推理能力检测
-  if (id.includes('reasoner') || id.includes('o1') || id.includes('thinking') || 
-      id.includes('2.5-pro') || id.includes('2.5pro')) {
+  if (id.includes('reasoner') || id.includes('o1') || id.includes('thinking') ||
+    id.includes('2.5-pro') || id.includes('2.5pro')) {
     capabilities.reasoning = true;
   }
-  
+
   // 视觉能力检测
   if (id.includes('vision') || id.includes('4o') || id.includes('gpt-4-turbo') ||
-      id.includes('claude-3') || id.includes('gemini')) {
+    id.includes('claude-3') || id.includes('gemini')) {
     capabilities.vision = true;
   }
-  
+
   // 工具调用能力检测（大多数现代模型都支持）
   if (!id.includes('reasoner') && !id.includes('o1-') && !id.includes('o1')) {
     // 推理模型通常不支持工具调用
     capabilities.functionCalling = true;
   }
-  
+
   return capabilities;
 }
 
@@ -635,10 +655,10 @@ export function getAvailableModels(): { providerId: string; providerName: string
 }
 
 // 获取当前活跃提供商的可用模型（包含能力信息）
-export function getAvailableModelsWithCapabilities(): { 
-  providerId: string; 
-  providerName: string; 
-  models: ModelInfo[] 
+export function getAvailableModelsWithCapabilities(): {
+  providerId: string;
+  providerName: string;
+  models: ModelInfo[]
 }[] {
   const activeProviders = getActiveProviders();
   return activeProviders.map((p) => {
@@ -658,7 +678,7 @@ export function getAvailableModelsWithCapabilities(): {
 export function getModelCapabilitiesById(providerId: string, modelId: string): ModelCapabilities | undefined {
   const provider = getProviderById(providerId);
   if (!provider) return undefined;
-  
+
   const model = provider.models.find((m) => m.id === modelId);
   return model?.capabilities;
 }
@@ -724,11 +744,11 @@ export function createChatSession(title: string = '新对话'): ChatSession {
     createdAt: Date.now(),
     updatedAt: Date.now(),
   };
-  
+
   const sessions = getChatSessions();
   sessions.unshift(session);
   saveChatSessions(sessions);
-  
+
   return session;
 }
 
@@ -753,25 +773,25 @@ export function addMessageToSession(
 ): Message {
   const sessions = getChatSessions();
   const session = sessions.find((s) => s.id === sessionId);
-  
+
   const newMessage: Message = {
     ...message,
     id: crypto.randomUUID(),
     timestamp: Date.now(),
   };
-  
+
   if (session) {
     session.messages.push(newMessage);
     session.updatedAt = Date.now();
-    
+
     // 如果是第一条用户消息，更新会话标题
     if (session.messages.length === 1 && message.role === 'user') {
       session.title = message.content.slice(0, 30) + (message.content.length > 30 ? '...' : '');
     }
-    
+
     saveChatSessions(sessions);
   }
-  
+
   return newMessage;
 }
 
@@ -782,7 +802,7 @@ export function updateMessageInSession(
 ): void {
   const sessions = getChatSessions();
   const session = sessions.find((s) => s.id === sessionId);
-  
+
   if (session) {
     const message = session.messages.find((m) => m.id === messageId);
     if (message) {
@@ -799,7 +819,7 @@ export function deleteMessageFromSession(
 ): void {
   const sessions = getChatSessions();
   const session = sessions.find((s) => s.id === sessionId);
-  
+
   if (session) {
     session.messages = session.messages.filter((m) => m.id !== messageId);
     session.updatedAt = Date.now();
@@ -945,10 +965,10 @@ export function getMemoryStats(): { total: number; auto: number; manual: number 
 // 搜索记忆（简单文本搜索，实际使用时可替换为向量搜索）
 export function searchMemories(query: string): Memory[] {
   if (!query.trim()) return getMemories();
-  
+
   const memories = getMemories();
   const lowerQuery = query.toLowerCase();
-  return memories.filter((m) => 
+  return memories.filter((m) =>
     m.content.toLowerCase().includes(lowerQuery)
   );
 }
@@ -968,23 +988,23 @@ export function calculateImportance(memory: Memory, decayRate: DecayRate = 'norm
   if (memory.pinned) {
     return 100;
   }
-  
+
   const now = Date.now();
   const daysSinceLastAccess = (now - memory.lastAccessedAt) / (1000 * 60 * 60 * 24);
   const decayFactor = DECAY_FACTORS[decayRate];
-  
+
   // 基础分（根据来源）
   const baseScore = memory.source === 'manual' ? 60 : 40;
-  
+
   // 时间衰减：基础分 × 衰减因子^(天数)
   const decayedScore = baseScore * Math.pow(decayFactor, daysSinceLastAccess);
-  
+
   // 访问加成：log(accessCount + 1) × 10
   const accessBonus = Math.log(memory.accessCount + 1) * 10;
-  
+
   // 最终分数，限制在 0-100
   const finalScore = Math.min(100, Math.max(0, decayedScore + accessBonus));
-  
+
   return Math.round(finalScore * 10) / 10; // 保留一位小数
 }
 
@@ -1007,11 +1027,11 @@ export function recordMemoryAccess(id: string): void {
 // 批量记录多个记忆被访问
 export function recordMemoriesAccess(ids: string[]): void {
   if (ids.length === 0) return;
-  
+
   const memories = getMemories();
   const now = Date.now();
   const idSet = new Set(ids);
-  
+
   const updated = memories.map((m) => {
     if (idSet.has(m.id)) {
       return {
@@ -1023,7 +1043,7 @@ export function recordMemoriesAccess(ids: string[]): void {
     }
     return m;
   });
-  
+
   saveMemories(updated);
 }
 
@@ -1065,20 +1085,20 @@ export function getMemoryStatsEnhanced(decayRate: DecayRate = 'normal'): {
 } {
   const settings = getMemorySettings();
   const memories = getMemoriesWithImportance(decayRate);
-  
+
   const total = memories.length;
   const auto = memories.filter((m) => m.source === 'auto').length;
   const manual = memories.filter((m) => m.source === 'manual').length;
   const pinned = memories.filter((m) => m.pinned).length;
-  
+
   const avgImportance = total > 0
     ? Math.round(memories.reduce((sum, m) => sum + m.currentImportance, 0) / total * 10) / 10
     : 0;
-  
+
   const belowThreshold = memories.filter(
     (m) => !m.pinned && m.currentImportance < settings.importanceThreshold
   ).length;
-  
+
   return {
     total,
     auto,
@@ -1098,25 +1118,25 @@ export function previewCleanup(): {
 } {
   const settings = getMemorySettings();
   const memories = getMemoriesWithImportance(settings.decayRate);
-  
+
   // 分离固定和非固定记忆
   const pinnedMemories = memories.filter((m) => m.pinned);
   const unpinnedMemories = memories.filter((m) => !m.pinned);
-  
+
   // 按重要性分数排序（降序）
   unpinnedMemories.sort((a, b) => b.currentImportance - a.currentImportance);
-  
+
   const toDelete: (Memory & { currentImportance: number })[] = [];
   const willKeep: (Memory & { currentImportance: number })[] = [...pinnedMemories];
-  
+
   let reason: 'threshold' | 'limit' | 'both' | 'none' = 'none';
-  
+
   for (const memory of unpinnedMemories) {
     // 检查是否低于阈值
     const belowThreshold = memory.currentImportance < settings.importanceThreshold;
     // 检查是否超过数量限制（包括固定的）
     const overLimit = willKeep.length >= settings.maxMemoryCount;
-    
+
     if (belowThreshold || overLimit) {
       toDelete.push(memory);
       if (belowThreshold && overLimit) {
@@ -1130,7 +1150,7 @@ export function previewCleanup(): {
       willKeep.push(memory);
     }
   }
-  
+
   return { toDelete, willKeep, reason };
 }
 
@@ -1141,21 +1161,21 @@ export function performSmartCleanup(): {
   reason: string;
 } {
   const settings = getMemorySettings();
-  
+
   if (!settings.forgettingEnabled) {
     return { deletedCount: 0, deletedMemories: [], reason: '智能遗忘功能已禁用' };
   }
-  
+
   const { toDelete, willKeep, reason } = previewCleanup();
-  
+
   if (toDelete.length === 0) {
     return { deletedCount: 0, deletedMemories: [], reason: '没有需要清理的记忆' };
   }
-  
+
   // 保存保留的记忆（去除 currentImportance 字段）
   const memoriesToKeep: Memory[] = willKeep.map(({ currentImportance, ...m }) => m);
   saveMemories(memoriesToKeep);
-  
+
   // 生成清理原因描述
   let reasonText = '';
   switch (reason) {
@@ -1171,10 +1191,10 @@ export function performSmartCleanup(): {
     default:
       reasonText = `清理了 ${toDelete.length} 条记忆`;
   }
-  
+
   // 去除 currentImportance 字段
   const deletedMemories: Memory[] = toDelete.map(({ currentImportance, ...m }) => m);
-  
+
   return {
     deletedCount: toDelete.length,
     deletedMemories,
@@ -1195,26 +1215,26 @@ export function forceCleanup(count: number): {
 } {
   const settings = getMemorySettings();
   const memories = getMemoriesWithImportance(settings.decayRate);
-  
+
   // 分离固定和非固定记忆
   const pinnedMemories = memories.filter((m) => m.pinned);
   const unpinnedMemories = memories.filter((m) => !m.pinned);
-  
+
   // 按重要性分数排序（升序，最低的在前）
   unpinnedMemories.sort((a, b) => a.currentImportance - b.currentImportance);
-  
+
   // 取出要删除的记忆
   const toDelete = unpinnedMemories.slice(0, Math.min(count, unpinnedMemories.length));
   const toKeep = unpinnedMemories.slice(Math.min(count, unpinnedMemories.length));
-  
+
   // 合并保留的记忆
   const memoriesToKeep: Memory[] = [...pinnedMemories, ...toKeep].map(
     ({ currentImportance, ...m }) => m
   );
   saveMemories(memoriesToKeep);
-  
+
   const deletedMemories: Memory[] = toDelete.map(({ currentImportance, ...m }) => m);
-  
+
   return {
     deletedCount: toDelete.length,
     deletedMemories,
@@ -1320,7 +1340,7 @@ export function getEnabledTools(): Tool[] {
 export function getToolsByCategory(): { category: ToolCategory; tools: Tool[] }[] {
   const categories = getToolCategories();
   const tools = getTools();
-  
+
   return categories.map((category) => ({
     category,
     tools: tools.filter((t) => t.categoryId === category.id),
@@ -1338,7 +1358,7 @@ export function setAllToolsEnabled(enabled: boolean): void {
 export function setToolsEnabled(toolIds: string[], enabled: boolean): void {
   const tools = getTools();
   const idSet = new Set(toolIds);
-  const updated = tools.map((t) => 
+  const updated = tools.map((t) =>
     idSet.has(t.id) ? { ...t, enabled } : t
   );
   saveTools(updated);
@@ -1466,4 +1486,98 @@ export function updateUISettings(updates: Partial<UISettings>): UISettings {
   const updated = { ...current, ...updates };
   saveUISettings(updated);
   return updated;
+}
+
+// ==================== 快捷指令相关 ====================
+
+// 获取所有快捷指令
+export function getQuickCommands(): QuickCommand[] {
+  try {
+    const stored = storageGet<QuickCommand[] | null>(STORAGE_KEYS.QUICK_COMMANDS, null);
+    if (stored) {
+      return stored;
+    }
+  } catch (e) {
+    console.error('Failed to load quick commands:', e);
+  }
+  return [];
+}
+
+// 保存快捷指令列表
+export function saveQuickCommands(commands: QuickCommand[]): void {
+  try {
+    storageSet(STORAGE_KEYS.QUICK_COMMANDS, commands);
+    window.dispatchEvent(new CustomEvent('quick-commands-updated'));
+  } catch (e) {
+    console.error('Failed to save quick commands:', e);
+  }
+}
+
+// 添加新快捷指令
+export function addQuickCommand(command: Omit<QuickCommand, 'id' | 'createdAt' | 'updatedAt'>): QuickCommand {
+  const commands = getQuickCommands();
+
+  // 检查名称是否已存在
+  const exists = commands.some(c => c.name.toLowerCase() === command.name.toLowerCase());
+  if (exists) {
+    throw new Error(`命令名称 "${command.name}" 已存在`);
+  }
+
+  const newCommand: QuickCommand = {
+    ...command,
+    id: crypto.randomUUID(),
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+
+  commands.push(newCommand);
+  saveQuickCommands(commands);
+
+  return newCommand;
+}
+
+// 更新快捷指令
+export function updateQuickCommand(id: string, updates: Partial<Omit<QuickCommand, 'id' | 'createdAt'>>): void {
+  const commands = getQuickCommands();
+  const index = commands.findIndex(c => c.id === id);
+
+  if (index === -1) {
+    throw new Error(`未找到 ID 为 "${id}" 的快捷指令`);
+  }
+
+  // 如果更新了名称，检查是否与其他命令重复
+  if (updates.name) {
+    const exists = commands.some(
+      (c, i) => i !== index && c.name.toLowerCase() === updates.name!.toLowerCase()
+    );
+    if (exists) {
+      throw new Error(`命令名称 "${updates.name}" 已存在`);
+    }
+  }
+
+  commands[index] = {
+    ...commands[index],
+    ...updates,
+    updatedAt: Date.now(),
+  };
+
+  saveQuickCommands(commands);
+}
+
+// 删除快捷指令
+export function deleteQuickCommand(id: string): void {
+  const commands = getQuickCommands();
+  const filtered = commands.filter(c => c.id !== id);
+
+  if (filtered.length === commands.length) {
+    throw new Error(`未找到 ID 为 "${id}" 的快捷指令`);
+  }
+
+  saveQuickCommands(filtered);
+}
+
+// 根据 ID 获取快捷指令
+export function getQuickCommandById(id: string): QuickCommand | null {
+  const commands = getQuickCommands();
+  return commands.find(c => c.id === id) || null;
 }

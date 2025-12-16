@@ -24,8 +24,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setAutoLaunch: (enable: boolean) =>
     ipcRenderer.invoke('set-auto-launch', enable),
 
-  // 文件附件 API
-  selectFiles: () => ipcRenderer.invoke('select-files'),
+  // 文件附件 API（接受模型能力参数）
+  selectFiles: (capabilities?: Record<string, boolean>) =>
+    ipcRenderer.invoke('select-files', capabilities),
   readFileContent: (filePath: string) =>
     ipcRenderer.invoke('read-file-content', filePath),
 

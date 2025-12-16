@@ -1,10 +1,20 @@
 /// <reference types="vite/client" />
 
+// 模型能力接口（与 storage.ts 保持同步）
+interface ModelCapabilitiesForIPC {
+  reasoning?: boolean;
+  functionCalling?: boolean;
+  vision?: boolean;
+  audio?: boolean;
+  video?: boolean;
+  documents?: boolean;
+}
+
 // 文件附件接口
 interface FileAttachment {
   id: string;
   name: string;
-  type: 'image' | 'document' | 'unknown';
+  type: 'image' | 'audio' | 'video' | 'document' | 'unknown';
   size: number;
   base64: string;
   dataUrl: string;
@@ -37,8 +47,8 @@ interface ElectronAPI {
   // 开机自启设置
   setAutoLaunch: (enable: boolean) => Promise<boolean>;
 
-  // 文件附件 API
-  selectFiles: () => Promise<FileAttachment[]>;
+  // 文件附件 API（接受模型能力参数）
+  selectFiles: (capabilities?: ModelCapabilitiesForIPC) => Promise<FileAttachment[]>;
   readFileContent: (filePath: string) => Promise<FileContentResult | null>;
 
   // 系统能力
@@ -49,4 +59,3 @@ interface ElectronAPI {
 interface Window {
   electronAPI?: ElectronAPI;
 }
-

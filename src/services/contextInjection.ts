@@ -82,9 +82,9 @@ export async function buildContextWithMemories(
       .join('\n');
 
     const memorySection = `
-## 相关记忆
+## 用户相关记忆
 
-以下是与用户当前问题相关的历史记忆，请在回答时参考这些信息：
+以下是关于该用户的重要信息，请在回答时务必参考这些记忆：
 
 ${memoryContext}
 
@@ -118,40 +118,56 @@ async function retrieveRelevantMemories(
   // 检查是否有嵌入向量
   const memoriesWithEmbedding = memories.filter((m) => m.embedding && m.embedding.length > 0);
 
+  let results: RetrievedMemory[] = [];
+
   if (memoriesWithEmbedding.length === 0) {
     // 没有嵌入向量，使用简单的关键词匹配
-    return simpleKeywordSearch(query, memories, maxCount);
-  }
+    results = simpleKeywordSearch(query, memories, maxCount);
+  } else {
+    // 生成查询嵌入
+    const queryEmbedding = await generateEmbedding(query);
 
-  // 生成查询嵌入
-  const queryEmbedding = await generateEmbedding(query);
+    if (!queryEmbedding) {
+      // 嵌入生成失败，回退到关键词搜索
+      results = simpleKeywordSearch(query, memories, maxCount);
+    } else {
+      // 计算相似度并排序
+      for (const memory of memoriesWithEmbedding) {
+        const similarity = cosineSimilarity(queryEmbedding, memory.embedding!);
 
-  if (!queryEmbedding) {
-    // 嵌入生成失败，回退到关键词搜索
-    return simpleKeywordSearch(query, memories, maxCount);
-  }
+        if (similarity >= threshold) {
+          results.push({
+            id: memory.id,
+            content: memory.content,
+            similarity,
+            source: memory.source,
+          });
+        }
+      }
 
-  // 计算相似度并排序
-  const results: RetrievedMemory[] = [];
-
-  for (const memory of memoriesWithEmbedding) {
-    const similarity = cosineSimilarity(queryEmbedding, memory.embedding!);
-
-    if (similarity >= threshold) {
-      results.push({
-        id: memory.id,
-        content: memory.content,
-        similarity,
-        source: memory.source,
-      });
+      // 按相似度降序排序
+      results.sort((a, b) => b.similarity - a.similarity);
+      results = results.slice(0, maxCount);
     }
   }
 
-  // 按相似度降序排序
-  results.sort((a, b) => b.similarity - a.similarity);
+  // 如果没有找到匹配的记忆，返回最新的几条记忆作为上下文
+  // 这确保了AI始终能够访问到用户的关键信息
+  if (results.length === 0 && memories.length > 0) {
+    // 按创建时间降序排序，返回最新的记忆
+    const recentMemories = [...memories]
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, Math.min(maxCount, 3)); // 最多返回3条最新记忆
 
-  // 返回 Top K 结果
-  return results.slice(0, maxCount);
+    results = recentMemories.map((m) => ({
+      id: m.id,
+      content: m.content,
+      similarity: 0.5, // 给一个中等的相似度分数
+      source: m.source,
+    }));
+  }
+
+  return results;
 }
 
 // 简单关键词搜索（备用方案）
@@ -204,15 +220,19 @@ function simpleKeywordSearch(
 
 // 查询重写 - 使用工具模型优化搜索词
 async function rewriteQuery(userMessage: string): Promise<string> {
+  const memorySettings = getMemorySettings();
   const generalSettings = getGeneralSettings();
 
+  // 优先使用记忆设置中的工具模型，如果没有配置则回退到通用设置
+  const toolModelConfig = memorySettings.toolModel || generalSettings.toolModel;
+
   // 如果没有配置工具模型，使用原始查询
-  if (!generalSettings.toolModel) {
+  if (!toolModelConfig) {
     return userMessage;
   }
 
   // 解析工具模型配置
-  const [providerId, modelId] = generalSettings.toolModel.split(':');
+  const [providerId, modelId] = toolModelConfig.split(':');
 
   if (!providerId || !modelId) {
     return userMessage;
@@ -260,13 +280,17 @@ export async function extractAndSaveMemories(
 
   const generalSettings = getGeneralSettings();
 
+  // 优先使用记忆设置中的工具模型，如果没有配置则回退到通用设置
+  const toolModelConfig = settings.toolModel || generalSettings.toolModel;
+
   // 如果没有配置工具模型，跳过提取
-  if (!generalSettings.toolModel) {
+  if (!toolModelConfig) {
+    console.warn('Memory extraction skipped: No tool model configured in Memory or General settings');
     return [];
   }
 
   // 解析工具模型配置
-  const [providerId, modelId] = generalSettings.toolModel.split(':');
+  const [providerId, modelId] = toolModelConfig.split(':');
 
   if (!providerId || !modelId) {
     return [];
